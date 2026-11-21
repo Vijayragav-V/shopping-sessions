@@ -141,7 +141,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
-template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
+template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
@@ -193,97 +193,6 @@ template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
   scalar_rows<N>(data, callback);
 #endif
 }
-#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
-template <size_t N> constexpr auto newline_patterns() {
-  std::array<uint32_t, N> result{};
-  for (size_t phase = 0; phase < N; ++phase)
-    for (unsigned i = 0; i < 32; ++i)
-      if ((phase + i + 1) % N == 0)
-        result[phase] |= uint32_t(1) << i;
-  return result;
-}
-
-// Validate a newline-aligned batch before invoking callbacks. The compact
-// delimiter masks compare the two quote edges of every field in parallel.
-template <size_t N, class F>
-bool parse_batch(Str data, F &callback) {
-  constexpr size_t capacity = 4096;
-  if (data.empty() || data.size() > capacity || data.back() != '\n')
-    return false;
-  constexpr auto expected_newlines = newline_patterns<N>();
-  uint16_t bounds[capacity + 1];
-  bounds[0] = 0;
-  size_t count = 0;
-  unsigned phase = 0;
-  unsigned start_quoted = data.front() == '"', prior_sep = 1, prior_quote = 0;
-  for (size_t off = 0; off < data.size(); off += 32) {
-    auto remain = data.size() - off;
-    alignas(32) char tail[32]{};
-    const char *p = data.data() + off;
-    if (remain < 32) {
-      std::memcpy(tail, p, remain);
-      p = tail;
-    }
-    auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
-    auto lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n'));
-    auto comma = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(','));
-    uint32_t ends = _mm256_movemask_epi8(_mm256_or_si256(comma, lf));
-    uint32_t quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')));
-    unsigned char next = remain > 32 ? static_cast<unsigned char>(p[32]) : 0;
-    uint32_t sep_before = (ends << 1) | prior_sep;
-    uint32_t sep_after = (ends >> 1) | (uint32_t(next == ',' || next == '\n') << 31);
-    // A quote must border exactly one delimiter. A lone quote between two
-    // delimiters is invalid, as is any quote in the interior of a field.
-    if (quotes & ~(sep_before ^ sep_after))
-      return false;
-    uint32_t before = _pext_u32((quotes << 1) | prior_quote, ends);
-    uint32_t after = _pext_u32((quotes >> 1) | (uint32_t(next == '"') << 31), ends);
-    unsigned n = std::popcount(ends);
-    const uint32_t used = _bzhi_u32(UINT32_MAX, n);
-    if ((((after << 1) | start_quoted) ^ before) & used)
-      return false;
-    if (_pext_u32(_mm256_movemask_epi8(lf), ends) != (expected_newlines[phase] & used))
-      return false;
-    prior_sep = ends >> 31;
-    prior_quote = quotes >> 31;
-    if (ends) {
-      start_quoted = (after >> (n - 1)) & 1u;
-      phase = (phase + n) % N;
-    }
-    while (ends) {
-      bounds[++count] = uint16_t(off + std::countr_zero(ends) + 1);
-      ends &= ends - 1;
-    }
-  }
-  if (phase != 0) return false;
-  for (size_t row = 0; row < count; row += N) {
-    std::array<Str, N> fields;
-    for (size_t i = 0; i < N; ++i) {
-      const unsigned begin = bounds[row + i];
-      const unsigned quoted = data[begin] == '"';
-      const unsigned size = bounds[row + i + 1] - begin - 1;
-      fields[i] = {data.data() + begin + quoted, size - 2 * quoted};
-    }
-    callback(fields);
-  }
-  return true;
-}
-#endif
-
-template <size_t N, class F> void parse_rows(Str data, F &&callback) {
-#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
-  while (!data.empty()) {
-    auto end = data.size() < 3072 ? Str::npos : data.find('\n', 3072);
-    auto length = end == Str::npos ? data.size() : end + 1;
-    auto chunk = data.substr(0, length);
-    if (!parse_batch<N>(chunk, callback)) parse_rows_generic<N>(chunk, callback);
-    data.remove_prefix(length);
-  }
-#else
-  parse_rows_generic<N>(data, callback);
-#endif
-}
-
 template <size_t N, class F> void rows(Str data, F &&callback) {
 #ifdef SHOPPING_DIAGNOSTICS
   // Instrument all callbacks in one of every 32 chunks on each worker.
