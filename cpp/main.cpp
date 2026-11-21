@@ -13,6 +13,7 @@ template <class Generic, class Common> struct EventCallbacks {
 };
 size_t bucket(Key k) { return k.hash() % shards; }
 #include "event_layout.hpp"
+#include "alias_partition.hpp"
 struct RevisionIndex {
   Key id;
   uint32_t ingest, location;
@@ -717,6 +718,9 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
   using Candidate = RevisionIndex;
   using Worker = ScanWorker<Layout>;
   auto links = input.parts(data / "links");
+  const AliasPartition partition(links);
+  if (std::getenv("PROFILE"))
+    std::cerr << "Learned link placement " << partition.enabled() << '\n';
   timer.mark("catalogs and link mapping");
   std::vector<Worker> workers(threads);
   auto events = input.parts(data / "events");
@@ -762,7 +766,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                  if (r[0].empty() || r[1].empty())
                    return;
                  Key a = w.pool.encode(r[0], 'u'), b = w.pool.encode(r[1], 'u');
-                 size_t left = bucket(a), right = bucket(b);
+                 size_t left = partition(a,r[0]), right = partition(b,r[1]);
                  if (left == right) {
                    w.local_links[left].emplace_back(a, b);
                    return;
@@ -787,17 +791,16 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
 #ifdef SHOPPING_DIAGNOSTICS
                  ++workers[t].valid_clicks;
 #endif
-                 workers[t].clicks[alias.hash() % shards].emplace_back(
+                 workers[t].clicks[partition(alias,r[1])].emplace_back(
                      Key{alias.bits},
                      layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
                });
                return;
              }
-             auto put = [&](Key id, Key user, Event e, Time ingest) {
+             auto put = [&](Key id, Key user, size_t b, Event e, Time ingest) {
                auto &w = workers[t];
                uint64_t location = 0;
                if (user.bits) {
-                 size_t b = user.hash() % shards;
                  auto &rows = w.events[b];
                  location = uint64_t(rows.size()) * shards + b + 1;
                  rows.emplace_back(Key{user.bits}, layout.pack(e));
@@ -832,7 +835,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                w.valid_events += e.ts != bad;
 #endif
                Key user = e.ts == bad ? Key{} : w.pool.encode(r[1], 'u');
-               put(id, user, e, ingest);
+               put(id, user, partition(user,r[1]), e, ingest);
              };
              auto common_event = [&](const char *id, unsigned id_width,
                                      const char *user, unsigned user_width,
@@ -858,8 +861,9 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                ++workers[t].revisions;
                workers[t].valid_events += good;
 #endif
-               put(Key{uintptr_t(permute_key(event_word) << 1)},
-                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
+               Key alias = good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{};
+               put(Key{uintptr_t(permute_key(event_word) << 1)}, alias,
+                   partition.short_id(alias, user_word, user_width-1),
                    Event{good ? ts : bad, 0, 0}, ingest);
                return true;
              };
