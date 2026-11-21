@@ -17,9 +17,6 @@ int main() {
     Str arrival = "2026-02-28T21:05:07Z";
     auto [event, ingest] = event_clocks(input, arrival);
     assert(event == timestamp(input) && ingest == ingest_time(arrival));
-#ifdef SHOPPING_X86_CSV
-    if (wide_csv_supported()) assert(event_clocks<true>(input, arrival) == std::make_pair(event, ingest));
-#endif
   }
   for (const std::string data :
        {"", "header", "header\n", "a\n0\n12\n\n34", "a\n\n\n",

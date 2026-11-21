@@ -352,45 +352,17 @@ inline Time timestamp(Str s) {
   auto day = midnight(p);
   return day == bad ? bad : day + (seconds - offset * 60) * 1000LL;
 }
-// Two civil clocks in one shuffle, as in the typed Rust event decoder.
-#ifdef SHOPPING_X86_CSV
-__attribute__((target("ssse3")))
-inline std::pair<int, int> utc_clock_pair(const char *event, const char *arrival) {
-  const auto clocks = _mm_unpacklo_epi64(
-      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(event)),
-      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(arrival)));
-  const auto ascii = _mm_sub_epi8(clocks, _mm_set1_epi8('0'));
-  const auto digits = _mm_shuffle_epi8(ascii, _mm_setr_epi8(
-      0,1,3,4,6,7,-1,-1, 8,9,11,12,14,15,-1,-1));
-  // ingest_ts is always valid F1. Validate every digit and separator of ts.
-  const auto excess = _mm_subs_epu8(digits, _mm_set1_epi8(9));
-  const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
-  const auto limits = _mm_setr_epi16(23,59,59,0, 23,59,59,0);
-  const auto seconds = _mm_madd_epi16(pairs, _mm_setr_epi16(
-      3600,60,1,0, 3600,60,1,0));
-  const auto sums = _mm_add_epi32(seconds, _mm_shuffle_epi32(seconds, _MM_SHUFFLE(3,3,1,1)));
-  const bool valid = event[2] == ':' && event[5] == ':' &&
-      (_mm_movemask_epi8(_mm_cmpeq_epi8(excess, _mm_setzero_si128())) & 255) == 255 &&
-      !(_mm_movemask_epi8(_mm_cmpgt_epi16(pairs, limits)) & 255);
-  return {valid ? _mm_cvtsi128_si32(sums) : -1,
-          _mm_cvtsi128_si32(_mm_srli_si128(sums, 8))};
-}
-#endif
-template<bool wide = false>
+// Common UTC event/ingest pairs share the calendar lookup. The event
+// still receives the full separator, clock and calendar checks.
 inline std::pair<Time, Time> event_clocks(Str event, Str arrival) {
   const Time day = midnight(arrival.data());
+  const Time ingest = day == bad ? bad : day + clock_seconds<false>(arrival.data() + 11) * 1000LL;
   if (event.size() == 20 && event[10] == 'T' && event[19] == 'Z' &&
-      std::memcmp(event.data(), arrival.data(), 10) == 0 && day != bad) {
-#ifdef SHOPPING_X86_CSV
-    if constexpr (wide) {
-      const auto [ts, ingest] = utc_clock_pair(event.data()+11, arrival.data()+11);
-      return {ts < 0 ? bad : day + ts*1000LL, day + ingest*1000LL};
-    }
-#endif
-    const int ts = clock_seconds<true>(event.data()+11);
-    return {ts < 0 ? bad : day + ts*1000LL, day + clock_seconds<false>(arrival.data()+11)*1000LL};
+      std::memcmp(event.data(), arrival.data(), 10) == 0) {
+    int seconds = clock_seconds<true>(event.data() + 11);
+    return {seconds < 0 || day == bad ? bad : day + seconds * 1000LL, ingest};
   }
-  return {timestamp(event), day == bad ? bad : day + clock_seconds<false>(arrival.data()+11)*1000LL};
+  return {timestamp(event), ingest};
 }
 inline Time ingest_time(Str s) {
   if (s.size() != 20)
