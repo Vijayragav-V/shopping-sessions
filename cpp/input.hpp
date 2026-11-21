@@ -318,26 +318,31 @@ struct Key {
   size_t hash() const {
     if (indirect())
       return std::hash<Str>{}(view());
+#if defined(__SSE4_2__) && defined(__x86_64__)
+    auto low = uint32_t(_mm_crc32_u64(0, bits));
+    return (uint64_t(uint32_t(bits >> 1)) << 32) | low;
+#else
     uint64_t n = bits;
     n ^= n >> 30;
     n *= 0xbf58476d1ce4e5b9ULL;
     n ^= n >> 27;
     n *= 0x94d049bb133111ebULL;
     return n ^ (n >> 31);
+#endif
   }
-  Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
+  Str user_text(std::array<char, 9> &buffer) const {
     if (indirect())
       return view();
     uint64_t n = bits >> 1;
-    buffer[0] = prefix;
+    buffer[0] = 'u';
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
-  bool user_less(Key other, char prefix = 'u') const {
+  bool user_less(Key other) const {
     if (!indirect() && !other.indirect())
       return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
     std::array<char, 9> left, right;
-    return user_text(left, prefix) < other.user_text(right, prefix);
+    return user_text(left) < other.user_text(right);
   }
 };
 struct KeyHash {

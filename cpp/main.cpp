@@ -43,28 +43,7 @@ struct Click {
   Str id;
   Time ts;
   int32_t campaign;
-  static Click make(KeyPool &, Str id, Time ts, int campaign, Time) {
-    return {id, ts, campaign};
-  }
-  Time time(Time) const { return ts; }
-  bool operator<(const Click &b) const {
-    return ts == b.ts ? id > b.id : ts < b.ts;
-  }
 };
-struct CompactClick {
-  Key id;
-  uint32_t offset;
-  int32_t campaign;
-  static CompactClick make(KeyPool &pool, Str id, Time ts, int campaign, Time start) {
-    return {pool.encode(id, 'k'), uint32_t(ts - (start - reach)), campaign};
-  }
-  Time time(Time start) const { return start - reach + offset; }
-  bool operator<(const CompactClick &b) const {
-    return offset == b.offset ? b.id.user_less(id, 'k') : offset < b.offset;
-  }
-};
-template<class StoredEvent>
-using ClickFor = std::conditional_t<std::is_same_v<StoredEvent,CompactEvent>, CompactClick, Click>;
 template <class StoredEvent> struct Candidate {
   Key id, user;
   Time ingest;
@@ -126,7 +105,7 @@ template <class T> using Bins = std::array<std::vector<T>, shards>;
 template <class StoredEvent> struct Worker {
   Bins<Candidate<StoredEvent>> candidates;
   Bins<std::pair<Key, StoredEvent>> events;
-  Bins<std::pair<Key, ClickFor<StoredEvent>>> clicks;
+  Bins<std::pair<Key, Click>> clicks;
   KeyPool pool;
 };
 
@@ -162,6 +141,29 @@ void route_winners(std::span<const Candidate<StoredEvent>> rows,
 
 struct Catalog {
   Dict<int> product, campaign, category;
+  // A dense suffix index handles ordinary catalog IDs. The string comparison
+  // preserves padding and case; all other spellings use the exact dictionary.
+  std::vector<int> numbered_campaigns;
+  static int suffix(Str s) {
+    if (s.size() < 3 || s.size() > 8 || s[0] != 'c' || s[1] != '_')
+      return -1;
+    int value = 0;
+    for (unsigned char c : s.substr(2)) {
+      unsigned digit = unsigned(c) - '0';
+      if (digit > 9) return -1;
+      value = value * 10 + int(digit);
+    }
+    return value;
+  }
+  int campaign_id(Str s) const {
+    unsigned n = unsigned(suffix(s));
+    if (n < numbered_campaigns.size()) {
+      int id = numbered_campaigns[n];
+      if (id && campaigns[id] == s) return id;
+    }
+    auto it = campaign.find(s);
+    return it == campaign.end() ? 0 : it->second;
+  }
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
       channels{"organic"};
   template <class F> void read(Input &input, const fs::path &file, F f) {
@@ -182,6 +184,11 @@ struct Catalog {
       campaigns.push_back(r[0]);
       channels.push_back(r[1]);
     });
+    numbered_campaigns.resize(std::min<size_t>(campaigns.size() * 2, 1000000));
+    for (size_t i = 1; i < campaigns.size(); ++i) {
+      unsigned n = unsigned(suffix(campaigns[i]));
+      if (n < numbered_campaigns.size()) numbered_campaigns[n] = int(i);
+    }
   }
 };
 struct Window {
@@ -362,7 +369,7 @@ std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
 }
 
 template <class StoredEvent>
-void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<StoredEvent>> clicks,
+void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
                Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
@@ -371,7 +378,9 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<Store
   {
     MEASURE(sorting);
     if (!use_bins) std::sort(events.begin(), events.end());
-    std::sort(clicks.begin(), clicks.end());
+    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+      return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
+    });
   }
   // Exact click copies have no effect on the winner or distinct active
   // campaigns.
@@ -417,7 +426,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<Store
     daily.revenue += revenue;
     {
       MEASURE(attribution);
-      while (right < clicks.size() && clicks[right].time(window_start) <= start) {
+      while (right < clicks.size() && clicks[right].ts <= start) {
         int campaign = clicks[right++].campaign;
         auto &state = result.activity[campaign];
         if (state.count++ == 0) {
@@ -425,7 +434,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<Store
           result.active.push_back(campaign);
         }
       }
-      while (left < right && clicks[left].time(window_start) < start - reach) {
+      while (left < right && clicks[left].ts < start - reach) {
         auto &state = result.activity[clicks[left++].campaign];
         if (--state.count == 0) {
           int moved = result.active.back();
@@ -557,13 +566,13 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
       if (r[0].empty() || r[1].empty())
         return;
       Time ts = timestamp(r[3]);
-      auto c = cat.campaign.find(r[2]);
+      int c = cat.campaign_id(r[2]);
       if (ts < window.start - reach || ts >= window.end ||
-          c == cat.campaign.end())
+          !c)
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   ClickFor<StoredEvent>::make(workers[t].pool, r[0], ts, c->second, window.start));
+                                                   Click{r[0], ts, c});
     });
   });
   timer.mark("click CSV and person partition");
@@ -573,7 +582,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
   parallel(shards, threads, [&](size_t b, unsigned t) {
     std::vector<Group> groups;
     std::vector<StoredEvent> ordered_events;
-    std::vector<ClickFor<StoredEvent>> ordered_clicks;
+    std::vector<Click> ordered_clicks;
     {
       MEASURE(grouping);
       size_t event_count = 0;
@@ -638,7 +647,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   const uint64_t duration = uint64_t(window.end) - uint64_t(window.start);
   // The maximum legal price occupies 24 bits. Index zero is the unknown
   // category, and the final timestamp-offset value is reserved for discards.
-  if (duration <= UINT32_MAX - reach && cat.categories.size() <= 256)
+  if (duration <= UINT32_MAX && cat.categories.size() <= 256)
     process<CompactEvent>(data, output, threads, input, window, cat, timer);
   else
     process<Event>(data, output, threads, input, window, cat, timer);
