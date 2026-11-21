@@ -202,6 +202,18 @@ size_t batch(std::span<const R> rows, Length length) {
   }
   return n;
 }
+// Rust pqw specializes fixed-width groups. Each Parquet miniblock has
+// 32 values; widths 1, 2 and 4 pack exactly into 32-bit words.
+template <unsigned Width>
+inline void pack_small(Bytes &out, const uint64_t *values) {
+  constexpr unsigned per_word = 32 / Width;
+  for (unsigned i = 0; i < 32; i += per_word) {
+    uint32_t word = 0;
+    for (unsigned j = 0; j < per_word; ++j)
+      word |= uint32_t(values[i + j]) << (Width * j);
+    little(out, word);
+  }
+}
 template <class T> inline void delta_pack(Bytes &out, Str raw) {
   using Unsigned = std::make_unsigned_t<T>;
   const size_t count = raw.size() / sizeof(T);
@@ -252,6 +264,12 @@ template <class T> inline void delta_pack(Bytes &out, Str raw) {
       unsigned width = widths[j];
       if (!width)
         continue;
+      const auto *values = adjusted.data() + j * 32;
+      switch (width) {
+      case 1: pack_small<1>(out, values); continue;
+      case 2: pack_small<2>(out, values); continue;
+      case 4: pack_small<4>(out, values); continue;
+      }
       uint64_t acc = 0;
       unsigned used = 0;
       for (unsigned i = 0; i < 32; ++i) {
