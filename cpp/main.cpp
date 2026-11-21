@@ -1,6 +1,7 @@
 #include "input.hpp"
 #include "metrics.hpp"
 #include "output.hpp"
+#include "event_key.hpp"
 #include <climits>
 #include <map>
 #include <regex>
@@ -780,7 +781,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                  return;
                auto &w = workers[t];
                Time ingest = ingest_time(r[3]);
-               Key id = w.pool.encode(r[0], 'e');
+               Key id = event_key(w.pool, r[0]);
                Event e = validate(r, ingest, cat, window);
 #ifdef SHOPPING_DIAGNOSTICS
                ++w.revisions;
@@ -813,7 +814,9 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                ++workers[t].revisions;
                workers[t].valid_events += good;
 #endif
-               put(Key{uintptr_t(permute_key(event_word) << 1)},
+               Key encoded = compact_event_key(event_word, id_width - 1);
+               if (!encoded.bits) return false;
+               put(encoded,
                    good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
                    Event{good ? ts : bad, 0, 0}, ingest);
                return true;
