@@ -512,20 +512,55 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
     size_t capacity = 1;
     while (capacity < count + count / 2)
       capacity *= 2;
-    std::vector<Revision *> best(capacity, nullptr);
-    for (auto &w : workers)
-      for (auto &e : w.candidates[b]) {
-        size_t slot = (e.id.hash() / shards) & (capacity - 1);
-        while (best[slot] && !(best[slot]->id == e.id))
-          slot = (slot + 1) & (capacity - 1);
-        if (!best[slot])
-          best[slot] = &e;
-        else if (best[slot]->ingest > e.ingest) {
-          best[slot]->event.discard();
-          best[slot] = &e;
-        } else
-          e.event.discard();
+    const unsigned worker_bits = std::bit_width(threads-1);
+    if (count <= (UINT32_MAX >> worker_bits)) {
+      // Reject unrelated occupied slots by their fingerprint before touching
+      // the event payload. A matching fingerprint still requires exact ID equality.
+      std::vector<uint64_t> slots(capacity);
+      const unsigned worker_mask = (1u << worker_bits)-1;
+      std::array<Revision*,64> starts{};
+      for (unsigned w = 0; w < threads; ++w) {
+        auto &bin = workers[w].candidates[b];
+        starts[w] = bin.data();
+        for (size_t index = 0; index < bin.size(); ++index) {
+          auto &e = bin[index];
+          auto hash = e.id.hash();
+          uint32_t tag = uint32_t(hash >> 32);
+          uint64_t entry = (uint64_t(tag) << 32) | uint32_t(((index << worker_bits) | w) + 1);
+          size_t slot = (hash / shards) & (capacity - 1);
+          for (;; slot = (slot + 1) & (capacity - 1)) {
+            auto old = slots[slot];
+            if (!old) { slots[slot] = entry; break; }
+            if (uint32_t(old >> 32) != tag) continue;
+            uint32_t loc = uint32_t(old) - 1;
+            auto &prior = starts[loc & worker_mask][loc >> worker_bits];
+            if (!(e.id == prior.id)) continue;
+            if (e.ingest < prior.ingest) {
+              prior.event.discard();
+              slots[slot] = entry;
+            } else {
+              e.event.discard();
+            }
+            break;
+          }
+        }
       }
+    } else {
+      std::vector<Revision *> best(capacity, nullptr);
+      for (auto &w : workers)
+        for (auto &e : w.candidates[b]) {
+          size_t slot = (e.id.hash() / shards) & (capacity - 1);
+          while (best[slot] && !(best[slot]->id == e.id))
+            slot = (slot + 1) & (capacity - 1);
+          if (!best[slot])
+            best[slot] = &e;
+          else if (best[slot]->ingest > e.ingest) {
+            best[slot]->event.discard();
+            best[slot] = &e;
+          } else
+            e.event.discard();
+        }
+    }
     for (auto &w : workers)
       route_winners<StoredEvent>(w.candidates[b], ids, workers[t].events);
     for (auto &w : workers)
