@@ -151,6 +151,14 @@ template<size_t N,class F> void rows(Str data,F&& callback) {
 inline Time number(Str s, Time limit) {
     Time n=0;
     if (s.empty()) return bad;
+    if(s.size()<=18) {
+        for(unsigned char c:s) {
+            unsigned d=unsigned(c)-'0';
+            if(d>9) return bad;
+            n=n*10+d;
+        }
+        return n<=limit ? n : bad;
+    }
     for (unsigned char c:s) {
         unsigned d = unsigned(c)-'0';
         if (d>9 || n>(limit-static_cast<Time>(d))/10) return bad;
@@ -163,26 +171,45 @@ inline int pair_digits(const char* p) {
     unsigned b=unsigned(static_cast<unsigned char>(p[1]))-'0';
     return (a|b) < 16 && a<10 && b<10 ? int(10*a+b) : -1000;
 }
-inline Time timestamp(Str s) {
-    if ((s.size()!=20 && s.size()!=25) || s[4]!='-') return number(s,INT64_MAX);
-    if (s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return bad;
-    auto p=s.data();
+inline Time midnight(const char* p) {
+    struct CachedDay {uint64_t prefix{}; uint16_t suffix{}; Time result=bad;};
+    static thread_local std::array<CachedDay,64> cache{};
+    uint64_t prefix; uint16_t suffix;
+    std::memcpy(&prefix,p,8); std::memcpy(&suffix,p+8,2);
+    auto& hit=cache[(unsigned(uint8_t(p[8]))*11+uint8_t(p[9]))%64];
+    if(hit.prefix==prefix && hit.suffix==suffix) return hit.result;
     int century=pair_digits(p), yy=pair_digits(p+2), m=pair_digits(p+5), d=pair_digits(p+8);
-    int h=pair_digits(p+11), minute=pair_digits(p+14), sec=pair_digits(p+17);
     int y=century*100+yy;
-    if (century<0 || yy<0 || m<1 || m>12 || d<1 || unsigned(h)>23 || unsigned(minute)>59 || unsigned(sec)>59) return bad;
+    if (p[4]!='-' || p[7]!='-' || century<0 || yy<0 || m<1 || m>12 || d<1) return bad;
     constexpr int lengths[]={31,28,31,30,31,30,31,31,30,31,30,31};
     if (d>lengths[m-1]+(m==2 && y%4==0 && (y%100!=0 || y%400==0))) return bad;
+    y-=m<=2;
+    int era=(y>=0 ? y : y-399)/400, year=y-era*400;
+    int days=era*146097+year*365+year/4-year/100+(153*(m+(m>2?-3:9))+2)/5+d-1-719468;
+    hit={prefix,suffix,days*day_ms};
+    return hit.result;
+}
+inline Time timestamp(Str s) {
+    if ((s.size()!=20 && s.size()!=25) || s[4]!='-') return number(s,INT64_MAX);
+    auto p=s.data();
+    if (s[10]!='T' || s[13]!=':' || s[16]!=':') return bad;
+    int h=pair_digits(p+11), minute=pair_digits(p+14), sec=pair_digits(p+17);
+    if(unsigned(h)>23 || unsigned(minute)>59 || unsigned(sec)>59) return bad;
     int offset=0;
     if (s.size()==25) {
         int oh=pair_digits(p+20), om=pair_digits(p+23);
         if ((p[19]!='+' && p[19]!='-') || p[22]!=':' || unsigned(oh)>23 || unsigned(om)>59) return bad;
         offset=(oh*60+om)*(p[19]=='+' ? 1 : -1);
     } else if (p[19]!='Z') return bad;
-    y-=m<=2;
-    int era=(y>=0 ? y : y-399)/400, year=y-era*400;
-    int days=era*146097+year*365+year/4-year/100+(153*(m+(m>2?-3:9))+2)/5+d-1-719468;
-    return days*day_ms+((h*60+minute-offset)*60+sec)*1000LL;
+    auto day=midnight(p);
+    return day==bad ? bad : day+((h*60+minute-offset)*60+sec)*1000LL;
+}
+inline Time ingest_time(Str s) {
+    if(s.size()!=20) return timestamp(s);
+    // The contract guarantees F1 for ingest_ts.
+    auto pair=[&](size_t i){return (s[i]-'0')*10+s[i+1]-'0';};
+    auto day=midnight(s.data());
+    return day==bad ? bad : day+((pair(11)*60+pair(14))*60+pair(17))*1000LL;
 }
 // Common identifiers contain a prefix and up to eight suffix bytes. Encode
 // them losslessly inline. Other byte strings refer to stable, borrowed views.

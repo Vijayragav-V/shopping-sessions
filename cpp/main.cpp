@@ -3,6 +3,7 @@
 #include "output.hpp"
 #include <map>
 #include <regex>
+#include <span>
 
 constexpr size_t shards=128;
 size_t bucket(Key k) { return k.hash()%shards; }
@@ -60,7 +61,6 @@ Event validate(const std::array<Str,7>& r, Time ingest, const Catalog& catalog, 
     auto it=catalog.product.find(r[5]);
     return {ts,int32_t(price),it==catalog.product.end()?0:it->second};
 }
-struct Person { std::vector<Event> events; std::vector<Click> clicks; };
 using Totals=std::map<std::pair<int,int32_t>,Counts>;
 int32_t utc_day(Time ts) { return int32_t(ts/day_ms-(ts%day_ms<0)); }
 struct Result {
@@ -90,8 +90,7 @@ struct Result {
     }
 };
 
-void summarize(Key user, Person& person,const Catalog& cat,Result& result) {
-    auto& events=person.events; auto& clicks=person.clicks;
+void summarize(Key user, std::span<Event> events,std::span<Click> clicks,const Catalog& cat,Result& result) {
     if(events.empty()) return;
     {
     MEASURE(sorting);
@@ -169,7 +168,7 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
     parallel(events.size(),threads,[&](size_t i,unsigned t){
         rows<7>(events[i],[&](auto& r){
             if(r[0].empty()) return;
-            Time ingest=timestamp(r[3]);
+            Time ingest=ingest_time(r[3]);
             // Invalid revisions still take part in earliest-ingest selection.
             Key id=workers[t].pool.encode(r[0],'e');
             Event e=validate(r,ingest,cat,window);
@@ -216,22 +215,48 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
     std::vector<Result> results(threads);
     for(auto& result:results) result.configure(window,cat.campaigns.size(),threads);
     parallel(shards,threads,[&](size_t b,unsigned t){
-        std::unordered_map<Key,Person,KeyHash> people;
+        struct Group { Key user; size_t event_end{},click_end{}; };
+        std::vector<Group> groups;
+        std::vector<Event> ordered_events;
+        std::vector<Click> ordered_clicks;
         {
         MEASURE(grouping);
+        std::unordered_map<Key,size_t,KeyHash> ids;
         for(auto& w:workers) {
-            for(auto& [u,e]:w.events[b]) people[u].events.push_back(e);
-            decltype(w.events)::value_type().swap(w.events[b]);
+            for(auto& [u,e]:w.events[b]) {
+                auto [it,added]=ids.try_emplace(u,groups.size());
+                if(added) groups.push_back({u});
+                ++groups[it->second].event_end;
+                u.bits=it->second;
+            }
         }
         for(auto& w:workers) {
             for(auto& [u,c]:w.clicks[b]) {
-                auto it=people.find(u);
-                if(it!=people.end()) it->second.clicks.push_back(c);
+                auto it=ids.find(u);
+                if(it==ids.end()) u.bits=UINTPTR_MAX;
+                else {u.bits=it->second; ++groups[it->second].click_end;}
             }
+        }
+        size_t ne=0,nc=0;
+        for(auto& g:groups) {
+            size_t events=g.event_end, clicks=g.click_end;
+            g.event_end=ne; g.click_end=nc;
+            ne+=events; nc+=clicks;
+        }
+        ordered_events.resize(ne); ordered_clicks.resize(nc);
+        for(auto& w:workers) {
+            for(auto& [u,e]:w.events[b]) ordered_events[groups[u.bits].event_end++]=e;
+            for(auto& [u,c]:w.clicks[b]) if(u.bits!=UINTPTR_MAX) ordered_clicks[groups[u.bits].click_end++]=c;
+            decltype(w.events)::value_type().swap(w.events[b]);
             decltype(w.clicks)::value_type().swap(w.clicks[b]);
         }
         }
-        for(auto& [u,p]:people) summarize(u,p,cat,results[t]);
+        size_t ep=0,cp=0;
+        for(auto& g:groups) {
+            summarize(g.user,std::span(ordered_events).subspan(ep,g.event_end-ep),
+                std::span(ordered_clicks).subspan(cp,g.click_end-cp),cat,results[t]);
+            ep=g.event_end; cp=g.click_end;
+        }
     });
     timer.mark("person grouping, sorting, sessions, attribution and aggregation");
     fs::create_directories(output/"user_daily");
