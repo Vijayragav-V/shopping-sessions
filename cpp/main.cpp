@@ -223,17 +223,23 @@ void summarize(Key user, std::span<typename Layout::E> events,
   }
   size_t left = 0, right = 0;
   UserDay daily{user, 0, 0, 0, 0, {}};
+  uint64_t small_categories = 0;
   auto finish_day = [&] {
     MEASURE(aggregation);
     int64_t best = 0;
-    for (int k : result.purchased) {
+    auto consider = [&](int k) {
       auto &v = result.spend[k];
       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
         best = v;
         daily.category = &cat.categories[k];
       }
       v = 0;
+    };
+    while (small_categories) {
+      consider(std::countr_zero(small_categories));
+      small_categories &= small_categories - 1;
     }
+    for (int k : result.purchased) consider(k);
     result.user_file->append(daily);
     result.purchased.clear();
   };
@@ -247,7 +253,9 @@ void summarize(Key user, std::span<typename Layout::E> events,
   };
   auto spend = [&](int category, int64_t price) {
     auto &value = result.spend[category];
-    if (!value)
+    if (category < 64)
+      small_categories |= uint64_t{1} << category;
+    else if (!value)
       result.purchased.push_back(category);
     value += price;
   };
