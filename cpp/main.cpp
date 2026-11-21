@@ -610,7 +610,7 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
         y = root(y);
         if (x == y)
           break;
-        if (x->name.user_less(y->name))
+        if (std::less<Vertex *>{}(x, y))
           std::swap(x, y);
         auto *expected = x;
         if (std::atomic_ref<Vertex *>(x->parent).compare_exchange_weak(
@@ -640,8 +640,10 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
       std::span<E> ev;
       std::span<C> cl;
       size_t event_count = 0, click_count = 0;
+      Key canonical = head.name;
       Vertex *v = &head;
       do {
+        if (v != &head && v->name.user_less(canonical)) canonical = v->name;
         if (!v->events.empty()) {
           ev = v->events;
           event_count += ev.size();
@@ -677,7 +679,7 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
         if (merge_c)
           cl = click_buffer;
       }
-      summarize(head.name, ev, cl, cat, results[t], layout);
+      summarize(canonical, ev, cl, cat, results[t], layout);
     }
   });
   timer.mark("linked-person sessions, attribution and aggregation");
