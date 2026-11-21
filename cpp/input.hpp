@@ -330,19 +330,19 @@ struct Key {
     return n ^ (n >> 31);
 #endif
   }
-  Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
+  Str user_text(std::array<char, 9> &buffer) const {
     if (indirect())
       return view();
     uint64_t n = bits >> 1;
-    buffer[0] = prefix;
+    buffer[0] = 'u';
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
-  bool user_less(Key other, char prefix = 'u') const {
+  bool user_less(Key other) const {
     if (!indirect() && !other.indirect())
       return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
     std::array<char, 9> left, right;
-    return user_text(left, prefix) < other.user_text(right, prefix);
+    return user_text(left) < other.user_text(right);
   }
 };
 struct KeyHash {
