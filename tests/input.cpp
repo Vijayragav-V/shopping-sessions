@@ -1,4 +1,5 @@
 #include "../cpp/input.hpp"
+#include "../cpp/event_key.hpp"
 #include <cassert>
 #include <cstdio>
 #include <random>
@@ -10,7 +11,46 @@ template <size_t N> void compare_rows(Str data) {
   assert(actual == expected);
 }
 
+static void check_event_codec() {
+  std::mt19937 random(54179);
+  std::deque<std::string> text;
+  std::unordered_map<Key, Str, KeyHash> known;
+  KeyPool left, right;
+  for (unsigned i = 0; i < 50000; ++i) {
+    auto &id = text.emplace_back("e");
+    const unsigned n = 1 + random() % 10;
+    uint64_t value = 0;
+    bool canonical = n <= 8;
+    for (unsigned j = 0; j < n; ++j) {
+      constexpr char chars[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+      const unsigned d = random() % 36;
+      unsigned char c = chars[d];
+      if (i % 5 == 0 && j == n / 2) c = static_cast<unsigned char>(random());
+      id += char(c);
+      if (!j && c == '0' && n > 1) canonical = false;
+      if (c >= '0' && c <= '9') value = value * 36 + c - '0';
+      else if (c >= 'a' && c <= 'z') value = value * 36 + c - 'a' + 10;
+      else canonical = false;
+    }
+    canonical &= value < (uint64_t{1} << 40);
+    Key k = event_key(left, id);
+    assert(k == event_key(right, id));
+    if constexpr (sizeof(uintptr_t) == 8 && std::endian::native == std::endian::little)
+      assert(k.indirect() != canonical);
+    auto [it, inserted] = known.emplace(k, Str(id));
+    assert(inserted || it->second == id);
+  }
+}
+
 int main() {
+  check_event_codec();
+  for (Str input : {"2026-02-28T23:59:59Z", "2026-02-30T00:00:00Z",
+                    "2026-02-28T24:00:00Z", "2026-02-28T23:59:60Z",
+                    "2026-03-01T00:00:00-01:00", "0000000000000"}) {
+    Str arrival = "2026-02-28T21:05:07Z";
+    auto [event, ingest] = event_clocks(input, arrival);
+    assert(event == timestamp(input) && ingest == ingest_time(arrival));
+  }
   for (const std::string data :
        {"", "header", "header\n", "a\n0\n12\n\n34", "a\n\n\n",
         "long header\nlong first record\nx\nlong last record\n"}) {
