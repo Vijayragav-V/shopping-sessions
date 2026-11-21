@@ -821,7 +821,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
                    !user[user_width - 1])
                  return false;
-               Time ingest = ingest_time(arrival), ts = timestamp(event_time);
+               const auto [ts, ingest] = event_clocks(event_time, arrival);
                bool good = ts >= window.start && ts < window.end &&
                            ingest - ts <= day_ms;
 #ifdef SHOPPING_DIAGNOSTICS

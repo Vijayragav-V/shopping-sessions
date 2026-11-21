@@ -352,6 +352,18 @@ inline Time timestamp(Str s) {
   auto day = midnight(p);
   return day == bad ? bad : day + (seconds - offset * 60) * 1000LL;
 }
+// Common UTC event/ingest pairs share the calendar lookup. The event
+// still receives the full separator, clock and calendar checks.
+inline std::pair<Time, Time> event_clocks(Str event, Str arrival) {
+  const Time day = midnight(arrival.data());
+  const Time ingest = day == bad ? bad : day + clock_seconds<false>(arrival.data() + 11) * 1000LL;
+  if (event.size() == 20 && event[10] == 'T' && event[19] == 'Z' &&
+      std::memcmp(event.data(), arrival.data(), 10) == 0) {
+    int seconds = clock_seconds<true>(event.data() + 11);
+    return {seconds < 0 || day == bad ? bad : day + seconds * 1000LL, ingest};
+  }
+  return {timestamp(event), ingest};
+}
 inline Time ingest_time(Str s) {
   if (s.size() != 20)
     return timestamp(s);
