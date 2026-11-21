@@ -1,7 +1,6 @@
 #include "input.hpp"
 #include "metrics.hpp"
 #include "output.hpp"
-#include "event_key.hpp"
 #include <climits>
 #include <map>
 #include <regex>
@@ -350,10 +349,7 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
       capacity *= 2;
     MEASURE(dedup);
     auto resolve = [&]<class Value>() {
-      // Common event keys get one direct slot. Keep the first occupant there
-      // and resolve every collision by exact equality in a separate index.
-      std::vector<Value> home(capacity);
-      std::optional<ControlIndex<Value>> overflow;
+      ControlIndex<Value> best(capacity);
       auto seconds = [&](const Candidate &r, unsigned owner) {
         return r.ingest & 0x80000000u
                    ? workers[owner].extended[r.location].seconds
@@ -378,26 +374,15 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
           Key id = refs.key(i);
           auto hash = id.hash();
           auto location = 1 + (uint64_t(i) << 6) + owner;
-          auto equal = [&](Value code) {
-            const uint64_t prior = code - 1;
+          auto [slot, found] = best.locate(hash, [&](uint64_t code) {
+            auto prior = code - 1;
             return workers[prior & 63].candidates[b].key(prior >> 6) == id;
-          };
-          Value *winner = &home[(hash / shards) & (capacity - 1)];
-          if (!*winner) {
-            *winner = Value(location);
+          });
+          if (!found) {
+            best.insert(slot, hash, location);
             continue;
           }
-          if (!equal(*winner)) {
-            if (!overflow) overflow.emplace(capacity);
-            const auto mixed = permute_key(hash);
-            const auto [slot, found] = overflow->locate(mixed, equal);
-            if (!found) {
-              overflow->insert(slot, mixed, location);
-              continue;
-            }
-            winner = &overflow->values[slot];
-          }
-          const uint64_t prior = *winner - 1;
+          auto prior = best.values[slot] - 1;
           auto old_owner = unsigned(prior & 63);
           const auto r = refs[i];
           const auto old = workers[old_owner].candidates[b][prior >> 6];
@@ -409,7 +394,7 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
                             : r.ingest < old.ingest;
           if (before) {
             discard(old, old_owner);
-            *winner = Value(location);
+            best.values[slot] = location;
           } else
             discard(r, owner);
         }
@@ -808,7 +793,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                  return;
                auto &w = workers[t];
                Time ingest = ingest_time(r[3]);
-               Key id = event_key(w.pool, r[0]);
+               Key id = w.pool.encode(r[0], 'e');
                Event e = validate(r, ingest, cat, window);
 #ifdef SHOPPING_DIAGNOSTICS
                ++w.revisions;
@@ -841,9 +826,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                ++workers[t].revisions;
                workers[t].valid_events += good;
 #endif
-               Key encoded = compact_event_key(event_word, id_width - 1);
-               if (!encoded.bits) return false;
-               put(encoded,
+               put(Key{uintptr_t(permute_key(event_word) << 1)},
                    good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
                    Event{good ? ts : bad, 0, 0}, ingest);
                return true;
