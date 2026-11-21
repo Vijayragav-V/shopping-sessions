@@ -380,23 +380,11 @@ struct Identities {
     sizes.reserve(hint);
     canonical.reserve(hint);
   }
-  size_t locate(Key k, size_t hash) const {
-    auto i = hash & (slots.size() - 1);
+  size_t locate(Key k) const {
+    auto i = k.hash() & (slots.size() - 1);
     while (slots[i].key.bits && !(slots[i].key == k))
       i = (i + 1) & (slots.size() - 1);
     return i;
-  }
-  size_t locate(Key k) const { return locate(k, k.hash()); }
-  void prefetch(size_t hash) const {
-#if defined(__GNUC__) || defined(__clang__)
-    __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
-#elif defined(_MSC_VER) && defined(__SSE2__)
-    _mm_prefetch(reinterpret_cast<const char *>(
-                     &slots[hash & (slots.size() - 1)]),
-                 _MM_HINT_T0);
-#else
-    (void)hash;
-#endif
   }
   int id(Str s) {
     if (parent.size() * 3 >= slots.size() * 2) {
@@ -445,11 +433,10 @@ struct Identities {
     std::vector<int>().swap(sizes);
     std::vector<Key>().swap(canonical);
   }
-  Key resolve(Key key, size_t hash) const {
-    auto slot = slots[locate(key, hash)];
+  Key resolve(Key key) const {
+    auto slot = slots[locate(key)];
     return slot.key.bits ? Key{slot.value} : key;
   }
-  Key resolve(Key key) const { return resolve(key, key.hash()); }
 };
 
 template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {

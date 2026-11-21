@@ -4,8 +4,10 @@
 #include <map>
 #include <regex>
 #include <span>
+#include <type_traits>
 
 constexpr size_t shards = 512;
+constexpr uint32_t session_gap = 1'800'000;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
   Time ts;
@@ -29,9 +31,10 @@ struct CompactEvent {
             uint32_t(e.price)};
   }
   Event decode(Time start) const {
-    return {start + Time(bits >> 32), int32_t(bits & 0xffffff),
+    return {start + offset(), int32_t(bits & 0xffffff),
             int32_t((bits >> 24) & 0xff)};
   }
+  uint32_t offset() const { return uint32_t(bits >> 32); }
   bool valid() const { return bits != UINT64_MAX; }
   void discard() { bits = UINT64_MAX; }
   bool operator<(const CompactEvent &other) const { return bits < other.bits; }
@@ -105,37 +108,6 @@ template <class StoredEvent> struct Worker {
   Bins<std::pair<Key, Click>> clicks;
   KeyPool pool;
 };
-
-template <class StoredEvent>
-void route_winners(std::span<const Candidate<StoredEvent>> rows,
-                   const Identities &ids,
-                   Bins<std::pair<Key, StoredEvent>> &destination) {
-  struct Probe {
-    const Candidate<StoredEvent> *row;
-    size_t hash;
-  };
-  std::array<Probe, 32> probes;
-  while (!rows.empty()) {
-    auto batch = rows.first(std::min(rows.size(), probes.size()));
-    rows = rows.subspan(batch.size());
-    size_t count = 0;
-    // Start independent alias-table loads before following any probe chains.
-    for (const auto &row : batch) {
-      if (!row.event.valid())
-        continue;
-      auto hash = row.user.hash();
-      ids.prefetch(hash);
-      probes[count++] = {&row, hash};
-    }
-    for (size_t i = 0; i < count; ++i) {
-      const auto &[row, hash] = probes[i];
-      Key person = ids.resolve(row->user, hash);
-      size_t shard = person.bits == row->user.bits ? hash % shards : bucket(person);
-      destination[shard].emplace_back(person, row->event);
-    }
-  }
-}
-
 struct Catalog {
   Dict<int> product, campaign, category;
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
@@ -208,6 +180,78 @@ template <class T> struct ScratchArray {
 struct ActiveCampaign {
   size_t count{}, slot{};
 };
+
+struct TimeBins {
+  struct Bin {
+    uint32_t first, last;
+    size_t count{};
+  };
+  std::vector<Bin> bins;
+  std::vector<uint64_t> occupied;
+
+  void configure(uint64_t duration) {
+    uint64_t count = (duration - 1) / session_gap + 1;
+    if (count <= 4096) {
+      bins.resize(count);
+      occupied.resize((count + 63) / 64);
+    }
+  }
+
+  template <class Visit>
+  void sessions(std::span<CompactEvent> events, Time window_start, Visit visit) {
+    size_t purchases = 0;
+    {
+      MEASURE(session);
+      for (const auto event : events) {
+        uint32_t offset = event.offset(), index = offset / session_gap;
+        Bin &bin = bins[index];
+        if (bin.count++ == 0) {
+          bin.first = bin.last = offset;
+          occupied[index / 64] |= uint64_t(1) << (index % 64);
+        } else {
+          bin.first = std::min(bin.first, offset);
+          bin.last = std::max(bin.last, offset);
+        }
+        // Earlier rows have been consumed; reuse that space for purchases.
+        if (event.bits & 0xffffff)
+          events[purchases++] = event;
+      }
+    }
+    auto bought = events.first(purchases);
+    {
+      MEASURE(sorting);
+      std::sort(bought.begin(), bought.end());
+    }
+    uint32_t first = 0, last = 0;
+    size_t count = 0, next_purchase = 0;
+    auto emit = [&] {
+      size_t begin = next_purchase;
+      while (next_purchase < bought.size() && bought[next_purchase].offset() <= last)
+        ++next_purchase;
+      visit(window_start + first, count, bought.subspan(begin, next_purchase - begin));
+    };
+    // Every event inside one bin is within the gap. Between occupied bins,
+    // only the last actual timestamp and the next first timestamp matter.
+    for (size_t word = 0; word < occupied.size(); ++word) {
+      for (uint64_t mask = occupied[word]; mask; mask &= mask - 1) {
+        Bin &bin = bins[word * 64 + std::countr_zero(mask)];
+        if (count && bin.first - last > session_gap) {
+          emit();
+          count = 0;
+        }
+        if (!count)
+          first = bin.first;
+        last = bin.last;
+        count += bin.count;
+        bin.count = 0;
+      }
+      occupied[word] = 0;
+    }
+    if (count)
+      emit();
+  }
+};
+
 struct Result {
   ScratchArray<ActiveCampaign> activity;
   ScratchArray<int64_t> spend;
@@ -215,10 +259,12 @@ struct Result {
   std::vector<UserDay> users;
   Totals sparse;
   std::vector<Counts> table;
+  TimeBins time_bins;
   int32_t first_day{};
   size_t campaigns{};
   void configure(Window w, const Catalog &cat, unsigned threads) {
     size_t count = cat.campaigns.size();
+    time_bins.configure(uint64_t(w.end) - uint64_t(w.start));
     activity.configure(count);
     spend.configure(cat.categories.size());
     first_day = utc_day(w.start);
@@ -268,9 +314,11 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
                Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
+  const bool use_bins = std::is_same_v<StoredEvent, CompactEvent> &&
+                        events.size() >= 128 && !result.time_bins.bins.empty();
   {
     MEASURE(sorting);
-    std::sort(events.begin(), events.end());
+    if (!use_bins) std::sort(events.begin(), events.end());
     std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
       return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
     });
@@ -293,22 +341,18 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
     result.users.push_back(daily);
     result.purchased.clear();
   };
-  for (size_t i = 0; i < events.size();) {
-    auto start = events[i].decode(window_start).ts;
+  auto visit = [&](Time start, size_t count, std::span<StoredEvent> purchases) {
     auto day = utc_day(start);
     if (daily.sessions && day != daily.day) {
       finish_day();
       daily = {user, day, 0, 0, 0, {}};
     }
     daily.day = day;
-    size_t first = i;
     int64_t revenue = 0;
     {
       MEASURE(session);
-      Time previous;
-      do {
-        auto e = events[i++].decode(window_start);
-        previous = e.ts;
+      for (auto record : purchases) {
+        auto e = record.decode(window_start);
         if (e.price) {
           auto &spent = result.spend[e.category];
           if (!spent)
@@ -316,11 +360,10 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
           spent += e.price;
           revenue += e.price;
         }
-      } while (i < events.size() &&
-               events[i].decode(window_start).ts - previous <= 1800000);
+      }
     }
     ++daily.sessions;
-    daily.events += i - first;
+    daily.events += count;
     daily.revenue += revenue;
     {
       MEASURE(attribution);
@@ -350,6 +393,18 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
     counts.revenue += revenue;
     for (int campaign : result.active)
       ++result.at(campaign, day).assists;
+  };
+  if (use_bins) {
+    if constexpr (std::is_same_v<StoredEvent, CompactEvent>)
+      result.time_bins.sessions(events, window_start, visit);
+  } else {
+    for (size_t i = 0; i < events.size();) {
+      const size_t first = i++;
+      while (i < events.size() &&
+             events[i].decode(window_start).ts - events[i-1].decode(window_start).ts <= session_gap)
+        ++i;
+      visit(events[first].decode(window_start).ts, i-first, events.subspan(first, i-first));
+    }
   }
   finish_day();
   for (int campaign : result.active)
@@ -441,7 +496,11 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
           e.event.discard();
       }
     for (auto &w : workers)
-      route_winners<StoredEvent>(w.candidates[b], ids, workers[t].events);
+      for (auto &e : w.candidates[b])
+        if (e.event.valid()) {
+          auto user = ids.resolve(e.user);
+          workers[t].events[bucket(user)].emplace_back(user, e.event);
+        }
     for (auto &w : workers)
       std::vector<Revision>().swap(w.candidates[b]);
   });
