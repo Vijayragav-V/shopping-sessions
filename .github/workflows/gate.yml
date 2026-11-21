@@ -17,11 +17,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      TIER: ${{ (inputs.gate == 'B' || contains(github.event.head_commit.message, '[gate B]')) && 'B-public' || 'A' }}
+      TIER: ${{ (inputs.gate == 'B' || contains(github.event.head_commit.message, '[gate B]') || contains(github.event.head_commit.message, '[large checks]')) && 'B-public' || 'A' }}
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, persist-credentials: false}
       - uses: ./.github/actions/prepare-gate
+      # GCC's ThreadSanitizer reserves a fixed shadow range on x86 Linux.
+      # Set a compatible mapping entropy on this ephemeral public runner only.
+      - if: env.TIER == 'B-public'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
       - name: Run correctness gate
         run: bash tools/gate.sh "$TIER"
   scorer:
