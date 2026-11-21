@@ -14,7 +14,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     env:
-      TRIAL_START: 6dcd64f8d5dd8f2384a868b692fa60c71456543d
+      TRIAL_START: d8af8807e41f464a8447abc4dc2500df7dd15e0a
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, persist-credentials: false}

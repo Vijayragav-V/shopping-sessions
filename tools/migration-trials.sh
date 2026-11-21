@@ -54,20 +54,17 @@ for report in "$work"/pair-* "$work/screen"; do
     echo "::notice title=$(basename "$report")::$(basename "$(dirname "$binary")") $secs ($host)"
   done
 done
-# The Rust source uses AVX-512BW/VL unconditionally. Measure parity only
-# where its release binary executes and produces the full reference output.
-if grep -qw avx512vl /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
-  rust="$work/rust"
-  git init -q "$rust"
-  git -C "$rust" fetch -q --depth 1 https://github.com/Vijayragav-V/buildathon-tests.git 4c136a5866fcb98126b1864029a8a7f8201689eb
-  git -C "$rust" checkout -q --detach FETCH_HEAD
-  docker build --quiet -t shopping-trial:rust "$rust" > /dev/null
-  cid=$(docker create shopping-trial:rust)
-  docker cp "$cid:/pipeline" "$rust/pipeline"
-  docker rm "$cid" >/dev/null
-  "$rust/pipeline" "$work/input" "$work/rust-out"
-  python "$assets/starter-pyspark/scripts/compare.py" "$work/rust-out" "$work/ref"
-  python -u bench.py "$work/input" "$rust/pipeline" "${binaries[-1]}" --runs 11 --warmup 1
-else
-  echo "::notice title=Rust parity::CPU lacks required AVX-512 extensions"
-fi
+# The previous stage already paired the Rust binary on compatible hardware.
+# Compare the current C++ incumbent and both graph designs at final scale.
+rm -rf -- "$work/input" "$work/ref"
+"$assets/generate" --seed 47 --events 60000000 --clicks 15000000 --threads 2 --output "$work/final"
+"$assets/oracle/build/shopping" "$work/final" "$work/ref"
+python tools/reference_id.py 47 "$work/ref" > "$work/id"
+diff <(grep '^47 ' tools/reference-tables.txt) "$work/id"
+for binary in "${binaries[@]:1}"; do
+  "$binary" "$work/final" "$work/out"
+  python tools/compare_large.py "$work/out" "$work/ref"
+  rm -rf -- "$work/out"
+  id=$(basename "$(dirname "$binary")")
+  python -u bench.py "$work/final" "${binaries[0]}" "$binary" --runs 11 --warmup 1 | tee "$work/final-$id"
+done
