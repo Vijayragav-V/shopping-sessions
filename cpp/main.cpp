@@ -21,6 +21,58 @@ struct Candidate {
   Time ingest;
   Event event;
 };
+
+struct Group {
+  Key user;
+  size_t event_end{}, click_end{};
+};
+
+// A shard-local index into the contiguous groups. Row partitioning already
+// used the low bits of the hash, so probe with the remaining bits.
+class GroupIndex {
+  static constexpr size_t missing = SIZE_MAX;
+  std::vector<size_t> slots;
+  std::vector<Group> &groups;
+
+  size_t locate(Key user) const {
+    const size_t mask = slots.size() - 1;
+    size_t slot = (user.hash() / shards) & mask;
+    while (slots[slot] != missing && !(groups[slots[slot]].user == user))
+      slot = (slot + 1) & mask;
+    return slot;
+  }
+
+public:
+  GroupIndex(std::vector<Group> &groups, size_t event_count)
+      : slots(std::bit_ceil(std::clamp<size_t>(event_count / 16, 16, 8192)),
+              missing),
+        groups(groups) {}
+
+  size_t count_event(Key user) {
+    size_t slot = locate(user);
+    if (slots[slot] == missing) {
+      if (groups.size() >= slots.size() * 3 / 4) {
+        slots.assign(slots.size() * 2, missing);
+        for (size_t i = 0; i < groups.size(); ++i)
+          slots[locate(groups[i].user)] = i;
+        slot = locate(user);
+      }
+      slots[slot] = groups.size();
+      groups.push_back({user});
+    }
+    const size_t group = slots[slot];
+    ++groups[group].event_end;
+    return group;
+  }
+
+  size_t count_click(Key user) {
+    const size_t group = slots[locate(user)];
+    if (group != missing)
+      ++groups[group].click_end;
+    return group;
+  }
+};
+
 template <class T> using Bins = std::array<std::vector<T>, shards>;
 struct Worker {
   Bins<Candidate> candidates;
@@ -124,21 +176,36 @@ struct Result {
       return sparse[{campaign, day}];
     return table[size_t(day - first_day) * campaigns + campaign];
   }
-  void merge_into(Totals &merged) const {
-    auto add = [&](int campaign, int32_t day, const Counts &c) {
-      auto &dest = merged[{campaign, day}];
-      dest.sessions += c.sessions;
-      dest.purchases += c.purchases;
-      dest.revenue += c.revenue;
-      dest.assists += c.assists;
-    };
-    for (auto &[k, c] : sparse)
-      add(k.first, k.second, c);
-    for (size_t i = 0; i < table.size(); ++i)
-      if (table[i].sessions || table[i].assists)
-        add(i % campaigns, first_day + int32_t(i / campaigns), table[i]);
-  }
 };
+
+std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
+                                       const Catalog &cat) {
+  std::vector<CampaignDay> rows;
+  auto emit = [&](size_t campaign, int32_t day, const Counts &c) {
+    rows.push_back({cat.campaigns[campaign], cat.channels[campaign], day, c});
+  };
+  const Result &first = results.front();
+  if (first.table.empty()) {
+    Totals merged;
+    for (const auto &r : results)
+      for (const auto &[key, counts] : r.sparse)
+        merged[key].add(counts);
+    for (const auto &[key, counts] : merged)
+      emit(key.first, key.second, counts);
+    return rows;
+  }
+  // Workers share the catalog and window, so the same cell always names
+  // the same campaign and day. Sum corresponding cells in one pass.
+  for (size_t i = 0; i < first.table.size(); ++i) {
+    Counts total{};
+    for (const auto &r : results)
+      total.add(r.table[i]);
+    if (total.sessions || total.assists)
+      emit(i % first.campaigns, first.first_day + int32_t(i / first.campaigns),
+           total);
+  }
+  return rows;
+}
 
 void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
                const Catalog &cat, Result &result) {
@@ -344,36 +411,21 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   for (auto &result : results)
     result.configure(window, cat, threads);
   parallel(shards, threads, [&](size_t b, unsigned t) {
-    struct Group {
-      Key user;
-      size_t event_end{}, click_end{};
-    };
     std::vector<Group> groups;
     std::vector<Event> ordered_events;
     std::vector<Click> ordered_clicks;
     {
       MEASURE(grouping);
-      std::unordered_map<Key, size_t, KeyHash> ids;
-      for (auto &w : workers) {
-        for (auto &[u, e] : w.events[b]) {
-          auto [it, added] = ids.try_emplace(u, groups.size());
-          if (added)
-            groups.push_back({u});
-          ++groups[it->second].event_end;
-          u.bits = it->second;
-        }
-      }
-      for (auto &w : workers) {
-        for (auto &[u, c] : w.clicks[b]) {
-          auto it = ids.find(u);
-          if (it == ids.end())
-            u.bits = UINTPTR_MAX;
-          else {
-            u.bits = it->second;
-            ++groups[it->second].click_end;
-          }
-        }
-      }
+      size_t event_count = 0;
+      for (const auto &w : workers)
+        event_count += w.events[b].size();
+      GroupIndex index(groups, event_count);
+      for (auto &w : workers)
+        for (auto &[u, e] : w.events[b])
+          u.bits = index.count_event(u);
+      for (auto &w : workers)
+        for (auto &[u, c] : w.clicks[b])
+          u.bits = index.count_click(u);
       size_t ne = 0, nc = 0;
       for (auto &g : groups) {
         size_t events = g.event_end, clicks = g.click_end;
@@ -411,14 +463,8 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
                     ("part-" + std::to_string(i) + ".parquet"),
                 results[i].users);
   });
-  Totals merged;
-  for (auto &r : results)
-    r.merge_into(merged);
-  std::vector<CampaignDay> campaigns;
-  for (auto &[key, c] : merged)
-    campaigns.push_back(
-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
-  write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
+  write_campaigns(output / "campaign_daily" / "part-0.parquet",
+                  campaign_days(results, cat));
   timer.mark("merge and Parquet output");
 #ifdef SHOPPING_DIAGNOSTICS
   metrics::report();

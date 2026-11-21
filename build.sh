@@ -12,4 +12,7 @@ if [ "${DIAGNOSTICS:-0}" = 1 ]; then
   set -- -DSHOPPING_DIAGNOSTICS
   output=build/shopping-profile
 fi
+if [ "${SCORER_CPU:-0}" = 1 ] && [ "$(uname -m)" = x86_64 ]; then
+  set -- "$@" -march=x86-64-v3
+fi
 "${CXX:-c++}" -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "$@" -isystem "$arrow_dir/include" cpp/main.cpp "$arrow_dir/$parquet" "$arrow_dir/$arrow" -Wl,-rpath,"$arrow_dir" -o "$output"

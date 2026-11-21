@@ -103,8 +103,20 @@ template <size_t N, class F> void scalar_rows(Str data, F &&callback) {
   }
 }
 
-#if defined(__SSE2__)
+#if defined(__AVX2__)
+#include <immintrin.h>
+constexpr size_t scan_width = 32;
+inline std::pair<unsigned, unsigned> delimiters(const char *p) {
+  auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+  auto ends = _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(',')),
+                              _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')));
+  return {static_cast<unsigned>(_mm256_movemask_epi8(ends)),
+          static_cast<unsigned>(_mm256_movemask_epi8(
+              _mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))))};
+}
+#elif defined(__SSE2__)
 #include <emmintrin.h>
+constexpr size_t scan_width = 16;
 inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   auto v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
   auto ends = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(',')),
@@ -114,6 +126,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 }
 #elif defined(__aarch64__)
 #include <arm_neon.h>
+constexpr size_t scan_width = 16;
 inline unsigned mask(uint8x16_t matches) {
   constexpr uint8_t weights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
                                    1, 2, 4, 8, 16, 32, 64, 128};
@@ -129,7 +142,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 }
 #endif
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
-#if defined(__SSE2__) || defined(__aarch64__)
+#if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
   std::array<Str, N> fields;
@@ -146,11 +159,11 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
       fields[column] = s;
     ++column;
   };
-  for (size_t off = 0; off < data.size(); off += 16) {
+  for (size_t off = 0; off < data.size(); off += scan_width) {
     const char *base = data.data() + off;
-    char tail[16]{};
+    char tail[scan_width]{};
     const char *block = base;
-    if (data.size() - off < 16) {
+    if (data.size() - off < scan_width) {
       std::memcpy(tail, base, data.size() - off);
       block = tail;
     }

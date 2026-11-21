@@ -4,6 +4,8 @@ A high-throughput C++20 solution for the Shopping Sessions Buildathon challenge.
 
 The complete challenge contract is in [`rules.md`](rules.md).
 
+The starting implementation is [mwkhettab/shopping-sessions-cpp at 8b2f568](https://github.com/mwkhettab/shopping-sessions-cpp/tree/8b2f568600d0fb5cc9bc066dc13ce609ed5d0e7b). This version scans 32 bytes at a time with AVX2 on the scoring image, uses a contiguous hash table to group each shard's people, and sums campaign/day counters directly across workers.
+
 ## Build the submission image
 
 The scorer runs `linux/amd64`. Build the same image locally with Docker Buildx:
@@ -57,4 +59,23 @@ DATA_DIR=dev OUTPUT_DIR=output NCPU=8 ./build/shopping
 - Sharded event deduplication and person grouping
 - Parallel sessionization and campaign attribution
 - Direct Arrow/Parquet output
+
+## Verification
+
+With the organizer's generator on your path, unpack the public answer into
+`dev-answer/` and run:
+
+```sh
+python3 -m pip install polars==2.1.0
+make dev
+python3 verify.py build/shopping dev
+```
+
+The Linux image check builds the Dockerfile, runs all 36 fixtures, and compares
+both public dev tables with the organizer's answers. Running the check manually,
+or including `[benchmark]` in a commit message, also times the original and
+optimized images on generated seed 23 (20M events and 5M clicks). It reports
+Docker's start-to-exit time for each fresh container, alternates run order and
+compares both output tables. The historical measurements in `BENCHMARKS.md`
+belong to the upstream implementation.
 

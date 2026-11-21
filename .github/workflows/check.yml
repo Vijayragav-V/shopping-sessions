@@ -1,0 +1,58 @@
+name: Check submission image
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['cpp/**', 'Dockerfile', 'build.sh', '.github/workflows/check.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      IMAGE: shopping:candidate
+      MEM: 7g
+      BASE_COMMIT: a430cc5e045f514a08f8bbdf1deef2465d746b4d
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the linux/amd64 image and generator
+        run: |
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          python3 -m venv "$RUNNER_TEMP/checker"
+          "$RUNNER_TEMP/checker/bin/pip" install polars==2.1.0
+          echo "$RUNNER_TEMP/checker/bin" >> "$GITHUB_PATH"
+          echo "CPUS=$(nproc | awk '{print ($1 < 8 ? $1 : 8)}')" >> "$GITHUB_ENV"
+          cd "$RUNNER_TEMP"
+          base=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for asset in generator.zip dev-answer.zip; do
+            curl --fail --location --retry 3 "$base/$asset" -o "$asset"
+          done
+          sha256sum -c <<'SUMS'
+          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
+          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+          SUMS
+          unzip -q generator.zip && unzip -q dev-answer.zip
+          rustc --edition 2024 -O generator/src/main.rs -o generate
+      - name: Compare all fixtures and both public dev tables
+        run: |
+          python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+          "$RUNNER_TEMP/generate" --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev"
+          scripts/docker_run.sh "$RUNNER_TEMP/dev" "$RUNNER_TEMP/dev-out"
+          python scripts/compare.py "$RUNNER_TEMP/dev-out" "$RUNNER_TEMP/dev-answer"
+      - name: Benchmark both images on seed 23
+        if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[benchmark]')
+        run: |
+          mkdir "$RUNNER_TEMP/base"
+          git archive "$BASE_COMMIT" Dockerfile cpp build.sh | tar -xC "$RUNNER_TEMP/base"
+          docker build --platform linux/amd64 -t shopping:original "$RUNNER_TEMP/base"
+          "$RUNNER_TEMP/generate" --seed 23 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/practice"
+          python scripts/bench_images.py "$RUNNER_TEMP/practice" shopping:original "$IMAGE" | tee "$RUNNER_TEMP/times"
+          while IFS= read -r result; do
+            echo "::notice title=20M events on $CPUS vCPUs with $MEM RAM::$result"
+          done < <(grep ' median: ' "$RUNNER_TEMP/times")

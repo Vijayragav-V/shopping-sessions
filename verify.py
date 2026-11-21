@@ -9,7 +9,7 @@ root = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("binary", type=Path)
 parser.add_argument("dev", type=Path)
-parser.add_argument("--starter", type=Path, default=root / "starter-pyspark")
+parser.add_argument("--starter", type=Path, default=root)
 parser.add_argument("--answer", type=Path, default=root / "dev-answer")
 args = parser.parse_args()
 binary = args.binary.resolve()
