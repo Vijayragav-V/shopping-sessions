@@ -1,8 +1,10 @@
+import csv
 import json
 import re
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 if __package__:
     from .csv_rows import read_rows
@@ -59,12 +61,28 @@ def _click_rows(dataset, identities, campaigns):
 
 
 def _stage(con, name, schema, rows):
-    # Send columns in bounded batches. DuckDB owns the spillable cross-file state.
     columns = ", ".join(f"{column} {kind}" for column, kind in schema)
     con.execute(f"CREATE OR REPLACE TEMP TABLE {name} ({columns})")
-    values = ", ".join(f"unnest(?::{kind}[])" for _, kind in schema)
-    while batch := list(islice(rows, 16384)):
-        con.execute(f"INSERT INTO {name} SELECT {values}", [list(col) for col in zip(*batch)])
+    # run.sh puts TMPDIR on /scratch. Reuse one bounded spool for the bulk reader.
+    with NamedTemporaryFile(mode="w", encoding="utf-8", newline="", suffix=".csv") as spool:
+        writer = csv.writer(spool, quoting=csv.QUOTE_NOTNULL, lineterminator="\n")
+        # None is unquoted and empty. Every string, including "", is quoted.
+        path = spool.name.replace("'", "''")
+        copy = f"""
+            COPY {name} FROM '{path}' (
+                FORMAT CSV, AUTO_DETECT FALSE, HEADER FALSE,
+                NULLSTR '', ALLOW_QUOTED_NULLS FALSE, NEW_LINE '\\n'
+            )
+        """
+        rows = iter(rows)
+        while True:
+            writer.writerows(islice(rows, 131072))
+            spool.flush()
+            if spool.tell() == 0:
+                break
+            con.execute(copy)
+            spool.seek(0)
+            spool.truncate()
 
 
 def build_clean_tables(con, dataset_dir, linked_ids=None):
