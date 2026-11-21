@@ -44,6 +44,7 @@ template <class Layout> struct ScanWorker {
   };
   std::vector<std::array<Vertex *, 2>> edges;
   Bins<std::pair<Key, size_t>> endpoints;
+  Bins<std::pair<Key, Key>> local_links;
   KeyPool pool;
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
@@ -479,6 +480,34 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
       }
       return x.group;
     };
+    // Contract the observed intra-shard links before counting records. Each
+    // alias slot retains its own exact key, but points at the canonical group.
+    // Cross-shard edges below then join canonical groups in the global graph.
+    std::vector<size_t> parent;
+    auto local_root = [&](size_t i) {
+      while (i != parent[i]) {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+      }
+      return i;
+    };
+    for (auto &w : workers) {
+      auto &links = w.local_links[b];
+      for (const auto &[left, right] : links) {
+        size_t x = intern(left), y = intern(right);
+        while (parent.size() < groups.size()) parent.push_back(parent.size());
+        x = local_root(x);
+        y = local_root(y);
+        if (x != y) {
+          if (groups[y].key.user_less(groups[x].key)) std::swap(x, y);
+          parent[y] = x;
+        }
+      }
+      std::vector<std::pair<Key, Key>>().swap(links);
+    }
+    if (!parent.empty())
+      for (auto &slot : slots)
+        if (slot.key.bits) slot.group = local_root(slot.group);
     // First count each alias, then scatter into disjoint contiguous spans.
     // A linked person may own spans in several of these raw-user shards.
     auto &store = storage[b];
@@ -732,13 +761,16 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                rows<2>(links[job].body(), [&](auto &r) {
                  if (r[0].empty() || r[1].empty())
                    return;
+                 Key a = w.pool.encode(r[0], 'u'), b = w.pool.encode(r[1], 'u');
+                 size_t left = bucket(a), right = bucket(b);
+                 if (left == right) {
+                   w.local_links[left].emplace_back(a, b);
+                   return;
+                 }
                  size_t index = w.edges.size() * 2;
                  w.edges.push_back({});
-                 for (unsigned side = 0; side < 2; ++side) {
-                   Key key = w.pool.encode(r[side], 'u');
-                   w.endpoints[key.hash() % shards].emplace_back(key,
-                                                                 index + side);
-                 }
+                 w.endpoints[left].emplace_back(a, index);
+                 w.endpoints[right].emplace_back(b, index + 1);
                });
                return;
              }
