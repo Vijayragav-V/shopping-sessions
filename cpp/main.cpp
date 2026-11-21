@@ -7,7 +7,7 @@ constexpr size_t shards=128;
 size_t bucket(Str s) { return std::hash<Str>{}(s)%shards; }
 struct Event { Time ts; int32_t price, category; };
 struct Click { Str id; Time ts; int32_t campaign; };
-struct Candidate { Str id,user; Time ingest; Event event; };
+struct Candidate { Str id,user; Time ingest; Event event; size_t hash; };
 template<class T> using Bins=std::array<std::vector<T>,shards>;
 struct Worker {
     Bins<Candidate> candidates;
@@ -132,22 +132,32 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
             if(r[0].empty()) return;
             Time ingest=timestamp(r[3]);
             // Invalid revisions still take part in earliest-ingest selection.
-            workers[t].candidates[bucket(r[0])].push_back({r[0],r[1],ingest,validate(r,ingest,cat,window)});
+            size_t hash=std::hash<Str>{}(r[0]);
+            Event e=validate(r,ingest,cat,window);
+            workers[t].candidates[hash%shards].push_back({r[0],r[1],ingest,e,hash});
         });
     });
     timer.mark("event CSV, validation and partition");
     parallel(shards,threads,[&](size_t b,unsigned t){
-        Dict<const Candidate*> best;
         size_t count=0;
         for(auto& w:workers) count+=w.candidates[b].size();
-        best.reserve(count);
+        // The low hash bits selected this shard. Use the remaining bits
+        // for open addressing and compare the original bytes on a hash match.
+        size_t capacity=1;
+        while(capacity<count+count/2) capacity*=2;
+        std::vector<Candidate*> best(capacity,nullptr);
         for(auto& w:workers) for(auto& e:w.candidates[b]) {
-            auto [it,added]=best.emplace(e.id,&e);
-            if(!added && it->second->ingest>e.ingest) it->second=&e;
+            size_t slot=(e.hash/shards)&(capacity-1);
+            while(best[slot] && (best[slot]->hash!=e.hash || best[slot]->id!=e.id))
+                slot=(slot+1)&(capacity-1);
+            if(!best[slot]) best[slot]=&e;
+            else if(best[slot]->ingest>e.ingest) {
+                best[slot]->event.ts=bad; best[slot]=&e;
+            } else e.event.ts=bad;
         }
-        for(auto [_,p]:best) if(p->event.ts!=bad) {
-            auto user=ids.resolve(p->user);
-            workers[t].events[bucket(user)].emplace_back(user,p->event);
+        for(auto& w:workers) for(auto& e:w.candidates[b]) if(e.event.ts!=bad) {
+            auto user=ids.resolve(e.user);
+            workers[t].events[bucket(user)].emplace_back(user,e.event);
         }
         for(auto& w:workers) std::vector<Candidate>().swap(w.candidates[b]);
     });

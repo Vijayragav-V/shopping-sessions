@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -61,7 +62,7 @@ struct Input {
     }
 };
 
-template<size_t N, class F> void rows(Str data, F&& callback) {
+template<size_t N, class F> void scalar_rows(Str data, F&& callback) {
     std::array<Str,N> fields;
     while (!data.empty()) {
         size_t end = data.find('\n');
@@ -80,6 +81,70 @@ template<size_t N, class F> void rows(Str data, F&& callback) {
             else line.remove_prefix(comma+1);
         }
     }
+}
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+inline std::pair<unsigned,unsigned> delimiters(const char* p) {
+    auto v=_mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    auto ends=_mm_or_si128(_mm_cmpeq_epi8(v,_mm_set1_epi8(',')),_mm_cmpeq_epi8(v,_mm_set1_epi8('\n')));
+    return {_mm_movemask_epi8(ends),_mm_movemask_epi8(_mm_cmpeq_epi8(v,_mm_set1_epi8('"')))};
+}
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+inline unsigned mask(uint8x16_t matches) {
+    constexpr uint8_t weights[16]={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
+    auto bits=vandq_u8(matches,vld1q_u8(weights));
+    return vaddv_u8(vget_low_u8(bits)) | (unsigned(vaddv_u8(vget_high_u8(bits)))<<8);
+}
+inline std::pair<unsigned,unsigned> delimiters(const char* p) {
+    auto v=vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+    auto ends=vorrq_u8(vceqq_u8(v,vdupq_n_u8(',')),vceqq_u8(v,vdupq_n_u8('\n')));
+    return {mask(ends),mask(vceqq_u8(v,vdupq_n_u8('"')))};
+}
+#endif
+template<size_t N,class F> void rows(Str data,F&& callback) {
+#if defined(__SSE2__) || defined(__aarch64__)
+    if(data.empty()) return;
+    std::array<Str,N> fields;
+    size_t column=0, expected_quotes=0, actual_quotes=0;
+    const char* field=data.data();
+    auto finish_field=[&](const char* end) {
+        Str s(field,end-field);
+        if(s.size()>=2 && s.front()=='"' && s.back()=='"') {
+            s.remove_prefix(1); s.remove_suffix(1); expected_quotes+=2;
+        }
+        if(column<N) fields[column]=s;
+        ++column;
+    };
+    for(size_t off=0;off<data.size();off+=16) {
+        const char* base=data.data()+off;
+        char tail[16]{};
+        const char* block=base;
+        if(data.size()-off<16) { std::memcpy(tail,base,data.size()-off); block=tail; }
+        auto [ends,quotes]=delimiters(block);
+        while(ends) {
+            unsigned at=std::countr_zero(ends);
+            ends &= ends-1;
+            finish_field(base+at);
+            field=base+at+1;
+            if(base[at]=='\n') {
+                unsigned before=(1u<<at)-1;
+                actual_quotes+=std::popcount(quotes&before);
+                quotes &= ~before;
+                if(column==N && expected_quotes==actual_quotes) callback(fields);
+                column=actual_quotes=expected_quotes=0;
+            }
+        }
+        actual_quotes+=std::popcount(quotes);
+    }
+    if(data.back()!='\n') {
+        finish_field(data.data()+data.size());
+        if(column==N && expected_quotes==actual_quotes) callback(fields);
+    }
+#else
+    scalar_rows<N>(data,callback);
+#endif
 }
 
 inline Time number(Str s, Time limit) {
