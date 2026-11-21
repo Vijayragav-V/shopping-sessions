@@ -10,16 +10,41 @@ size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
   Time ts;
   int32_t price, category;
+
+  static Event encode(Event e, Time) { return e; }
+  Event decode(Time) const { return *this; }
+  bool valid() const { return ts != bad; }
+  void discard() { ts = bad; }
+  bool operator<(const Event &other) const { return ts < other.ts; }
+};
+
+// In a short window, timestamps fit in the high word. Sorting the whole key
+// also orders equal-time events by purchase details, which share a session.
+struct CompactEvent {
+  uint64_t bits;
+  static CompactEvent encode(Event e, Time start) {
+    if (!e.valid())
+      return {UINT64_MAX};
+    return {(uint64_t(e.ts - start) << 32) | (uint64_t(e.category) << 24) |
+            uint32_t(e.price)};
+  }
+  Event decode(Time start) const {
+    return {start + Time(bits >> 32), int32_t(bits & 0xffffff),
+            int32_t((bits >> 24) & 0xff)};
+  }
+  bool valid() const { return bits != UINT64_MAX; }
+  void discard() { bits = UINT64_MAX; }
+  bool operator<(const CompactEvent &other) const { return bits < other.bits; }
 };
 struct Click {
   Str id;
   Time ts;
   int32_t campaign;
 };
-struct Candidate {
+template <class StoredEvent> struct Candidate {
   Key id, user;
   Time ingest;
-  Event event;
+  StoredEvent event;
 };
 
 struct Group {
@@ -74,9 +99,9 @@ public:
 };
 
 template <class T> using Bins = std::array<std::vector<T>, shards>;
-struct Worker {
-  Bins<Candidate> candidates;
-  Bins<std::pair<Key, Event>> events;
+template <class StoredEvent> struct Worker {
+  Bins<Candidate<StoredEvent>> candidates;
+  Bins<std::pair<Key, StoredEvent>> events;
   Bins<std::pair<Key, Click>> clicks;
   KeyPool pool;
 };
@@ -207,14 +232,14 @@ std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
   return rows;
 }
 
-void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
-               const Catalog &cat, Result &result) {
+template <class StoredEvent>
+void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
+               Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
   {
     MEASURE(sorting);
-    std::sort(events.begin(), events.end(),
-              [](auto a, auto b) { return a.ts < b.ts; });
+    std::sort(events.begin(), events.end());
     std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
       return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
     });
@@ -238,7 +263,7 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     result.purchased.clear();
   };
   for (size_t i = 0; i < events.size();) {
-    auto start = events[i].ts;
+    auto start = events[i].decode(window_start).ts;
     auto day = utc_day(start);
     if (daily.sessions && day != daily.day) {
       finish_day();
@@ -249,8 +274,10 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     int64_t revenue = 0;
     {
       MEASURE(session);
+      Time previous;
       do {
-        auto e = events[i++];
+        auto e = events[i++].decode(window_start);
+        previous = e.ts;
         if (e.price) {
           auto &spent = result.spend[e.category];
           if (!spent)
@@ -258,7 +285,8 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
           spent += e.price;
           revenue += e.price;
         }
-      } while (i < events.size() && events[i].ts - events[i - 1].ts <= 1800000);
+      } while (i < events.size() &&
+               events[i].decode(window_start).ts - previous <= 1800000);
     }
     ++daily.sessions;
     daily.events += i - first;
@@ -308,15 +336,14 @@ struct Timer {
     last = now;
   }
 };
-void run(const fs::path &data, const fs::path &output, unsigned threads) {
-  Timer timer;
-  Input input;
-  Window window(input.map(data / "manifest.json"));
-  Catalog cat(input, data);
+template <class StoredEvent>
+void process(const fs::path &data, const fs::path &output, unsigned threads,
+             Input &input, Window window, const Catalog &cat, Timer &timer) {
+  using Revision = Candidate<StoredEvent>;
   Identities ids;
   auto links = input.parts(data / "links");
   timer.mark("catalogs and link mapping");
-  std::vector<Worker> workers(threads);
+  std::vector<Worker<StoredEvent>> workers(threads);
   auto events = input.parts(data / "events");
   size_t event_bytes = 0;
   for (auto chunk : events)
@@ -324,7 +351,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   // A bounded capacity hint only. All vectors grow independently on skew
   // or unusual row widths. Allow up to 2 GiB total initial storage.
   auto hint =
-      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Candidate)) /
+      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Revision)) /
       threads / shards;
   for (auto &worker : workers)
     for (auto &bin : worker.candidates)
@@ -354,7 +381,8 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
       Key id = workers[t].pool.encode(r[0], 'e');
       Event e = validate(r, ingest, cat, window);
       Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
-      workers[t].candidates[bucket(id)].push_back({id, user, ingest, e});
+      workers[t].candidates[bucket(id)].push_back(
+          {id, user, ingest, StoredEvent::encode(e, window.start)});
     });
   });
   timer.mark("event CSV, validation and partition");
@@ -367,7 +395,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     size_t capacity = 1;
     while (capacity < count + count / 2)
       capacity *= 2;
-    std::vector<Candidate *> best(capacity, nullptr);
+    std::vector<Revision *> best(capacity, nullptr);
     for (auto &w : workers)
       for (auto &e : w.candidates[b]) {
         size_t slot = (e.id.hash() / shards) & (capacity - 1);
@@ -376,19 +404,19 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
         if (!best[slot])
           best[slot] = &e;
         else if (best[slot]->ingest > e.ingest) {
-          best[slot]->event.ts = bad;
+          best[slot]->event.discard();
           best[slot] = &e;
         } else
-          e.event.ts = bad;
+          e.event.discard();
       }
     for (auto &w : workers)
       for (auto &e : w.candidates[b])
-        if (e.event.ts != bad) {
+        if (e.event.valid()) {
           auto user = ids.resolve(e.user);
           workers[t].events[bucket(user)].emplace_back(user, e.event);
         }
     for (auto &w : workers)
-      std::vector<Candidate>().swap(w.candidates[b]);
+      std::vector<Revision>().swap(w.candidates[b]);
   });
   timer.mark("global event dedup and person partition");
   auto clicks = input.parts(data / "clicks");
@@ -412,7 +440,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     result.configure(window, cat, threads);
   parallel(shards, threads, [&](size_t b, unsigned t) {
     std::vector<Group> groups;
-    std::vector<Event> ordered_events;
+    std::vector<StoredEvent> ordered_events;
     std::vector<Click> ordered_clicks;
     {
       MEASURE(grouping);
@@ -442,15 +470,15 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
         for (auto &[u, c] : w.clicks[b])
           if (u.bits != UINTPTR_MAX)
             ordered_clicks[groups[u.bits].click_end++] = c;
-        decltype(w.events)::value_type().swap(w.events[b]);
-        decltype(w.clicks)::value_type().swap(w.clicks[b]);
+        typename decltype(w.events)::value_type().swap(w.events[b]);
+        typename decltype(w.clicks)::value_type().swap(w.clicks[b]);
       }
     }
     size_t ep = 0, cp = 0;
     for (auto &g : groups) {
       summarize(g.user, std::span(ordered_events).subspan(ep, g.event_end - ep),
-                std::span(ordered_clicks).subspan(cp, g.click_end - cp), cat,
-                results[t]);
+                std::span(ordered_clicks).subspan(cp, g.click_end - cp),
+                window.start, cat, results[t]);
       ep = g.event_end;
       cp = g.click_end;
     }
@@ -469,6 +497,19 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
 #ifdef SHOPPING_DIAGNOSTICS
   metrics::report();
 #endif
+}
+void run(const fs::path &data, const fs::path &output, unsigned threads) {
+  Timer timer;
+  Input input;
+  Window window(input.map(data / "manifest.json"));
+  Catalog cat(input, data);
+  const uint64_t duration = uint64_t(window.end) - uint64_t(window.start);
+  // The maximum legal price occupies 24 bits. Index zero is the unknown
+  // category, and the final timestamp-offset value is reserved for discards.
+  if (duration <= UINT32_MAX && cat.categories.size() <= 256)
+    process<CompactEvent>(data, output, threads, input, window, cat, timer);
+  else
+    process<Event>(data, output, threads, input, window, cat, timer);
 }
 int main(int argc, char **argv) {
   auto env = [](const char *key, const char *fallback) {
