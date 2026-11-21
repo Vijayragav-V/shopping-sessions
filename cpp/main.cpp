@@ -6,7 +6,7 @@
 #include <span>
 #include <type_traits>
 
-constexpr size_t shards = 512;
+constexpr size_t shards = 128;
 constexpr uint32_t session_gap = 1'800'000;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
