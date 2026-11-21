@@ -26,6 +26,7 @@ for rev in "$base" "${commits[@]}"; do
   cid=$(docker create "shopping-trial:$name")
   docker cp "$cid:/app/shopping" "$dir/shopping"
   docker rm "$cid" >/dev/null
+  echo "Built $name on $host"
   binaries+=("$dir/shopping")
   if [[ $rev == "$base" ]]; then continue; fi
   python "$dir/verify.py" "$dir/shopping" "$work/dev" --starter "$assets/starter-pyspark" --answer "$assets/dev-answer"
