@@ -141,7 +141,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
-template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
 #if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
@@ -193,6 +193,74 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
   scalar_rows<N>(data, callback);
 #endif
 }
+#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
+struct CsvMasks {
+  uint64_t commas, lines, quotes;
+};
+inline CsvMasks csv_masks(const char *p) {
+  auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
+  auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + 32));
+  auto mask = [&](char c) {
+    auto test = _mm256_set1_epi8(c);
+    auto lo = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, test)));
+    auto hi = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, test)));
+    return uint64_t(lo) | (uint64_t(hi) << 32);
+  };
+  return {mask(','), mask('\n'), mask('"')};
+}
+#endif
+template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
+  while (data.size() >= 128) {
+    const char *p = data.data();
+    auto first = csv_masks(p);
+    size_t end;
+    uint64_t second_commas = 0;
+    unsigned quotes;
+    if (first.lines) {
+      end = std::countr_zero(first.lines);
+      first.commas = _bzhi_u64(first.commas, end);
+      quotes = std::popcount(_bzhi_u64(first.quotes, end));
+    } else {
+      auto second = csv_masks(p + 64);
+      if (!second.lines) {
+        size_t nl = data.find('\n', 128);
+        size_t len = nl == Str::npos ? data.size() : nl + 1;
+        parse_rows_generic<N>(data.substr(0, len), callback);
+        data.remove_prefix(len);
+        continue;
+      }
+      unsigned n = std::countr_zero(second.lines);
+      second_commas = _bzhi_u64(second.commas, n);
+      quotes = std::popcount(first.quotes) + std::popcount(_bzhi_u64(second.quotes, n));
+      end = 64 + n;
+    }
+    data.remove_prefix(end + 1);
+    if (std::popcount(first.commas) + std::popcount(second_commas) != N - 1)
+      continue;
+    uint8_t stops[N];
+    unsigned column = 0;
+    for (auto m = first.commas; m; m &= m-1)
+      stops[column++] = uint8_t(std::countr_zero(m));
+    for (auto m = second_commas; m; m &= m-1)
+      stops[column++] = uint8_t(64 + std::countr_zero(m));
+    stops[N-1] = uint8_t(end);
+    std::array<Str,N> fields;
+    unsigned start = 0, matched = 0;
+    for (size_t i = 0; i < N; ++i) {
+      unsigned stop = stops[i];
+      unsigned pair = unsigned(stop-start >= 2) & unsigned(p[start] == '"') &
+                      unsigned(p[stop ? stop-1 : 0] == '"');
+      fields[i] = {p+start+pair, stop-start-2*pair};
+      matched += pair;
+      start = stop+1;
+    }
+    if (2*matched == quotes) callback(fields);
+  }
+#endif
+  parse_rows_generic<N>(data, callback);
+}
+
 template <size_t N, class F> void rows(Str data, F &&callback) {
 #ifdef SHOPPING_DIAGNOSTICS
   // Instrument all callbacks in one of every 32 chunks on each worker.
