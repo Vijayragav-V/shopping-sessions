@@ -108,6 +108,37 @@ template <class StoredEvent> struct Worker {
   Bins<std::pair<Key, Click>> clicks;
   KeyPool pool;
 };
+
+template <class StoredEvent>
+void route_winners(std::span<const Candidate<StoredEvent>> rows,
+                   const Identities &ids,
+                   Bins<std::pair<Key, StoredEvent>> &destination) {
+  struct Probe {
+    const Candidate<StoredEvent> *row;
+    size_t hash;
+  };
+  std::array<Probe, 32> probes;
+  while (!rows.empty()) {
+    auto batch = rows.first(std::min(rows.size(), probes.size()));
+    rows = rows.subspan(batch.size());
+    size_t count = 0;
+    // Start independent alias-table loads before following any probe chains.
+    for (const auto &row : batch) {
+      if (!row.event.valid())
+        continue;
+      auto hash = row.user.hash();
+      ids.prefetch(hash);
+      probes[count++] = {&row, hash};
+    }
+    for (size_t i = 0; i < count; ++i) {
+      const auto &[row, hash] = probes[i];
+      Key person = ids.resolve(row->user, hash);
+      size_t shard = person.bits == row->user.bits ? hash % shards : bucket(person);
+      destination[shard].emplace_back(person, row->event);
+    }
+  }
+}
+
 struct Catalog {
   Dict<int> product, campaign, category;
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
@@ -496,11 +527,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
           e.event.discard();
       }
     for (auto &w : workers)
-      for (auto &e : w.candidates[b])
-        if (e.event.valid()) {
-          auto user = ids.resolve(e.user);
-          workers[t].events[bucket(user)].emplace_back(user, e.event);
-        }
+      route_winners<StoredEvent>(w.candidates[b], ids, workers[t].events);
     for (auto &w : workers)
       std::vector<Revision>().swap(w.candidates[b]);
   });
