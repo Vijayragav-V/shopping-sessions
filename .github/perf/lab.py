@@ -31,7 +31,8 @@ def timed(exe, data, out, profile=False):
     if profile:
         env["PROFILE"] = "1"
     start = time.perf_counter()
-    p = run(exe, data, out, env=env, stderr=subprocess.PIPE, text=True)
+    command = ["/usr/bin/time", "-f", "peak RSS %M KiB"] if profile else []
+    p = run(*command, exe, data, out, env=env, stderr=subprocess.PIPE, text=True)
     return time.perf_counter()-start, p.stderr.strip()
 def generate(seed, n, path):
     run(tmp/"generate","--seed",str(seed),"--events",str(n),"--clicks",str(n//4),"--threads","2","--output",path)
@@ -66,7 +67,8 @@ for seed, size in sizes:
         wall, phases = timed(binaries[label],data,output,True)
         note(label+" phases "+str(size), f"release wall {wall:.4f}s\n"+phases)
         if i:
-            run(sys.executable, repo/"scripts/compare.py", output,reference)
+            script = "scripts/compare.py" if size == 20_000_000 else ".github/perf/compare_large.py"
+            run(sys.executable, repo/script, output,reference)
             shutil.rmtree(output)
     if "[profile]" in target and size == 20_000_000:
         for label in dict.fromkeys([labels[0],labels[-1]]):
