@@ -133,18 +133,22 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
   if (data.empty())
     return;
   std::array<Str, N> fields;
-  size_t column = 0, expected_quotes = 0, actual_quotes = 0;
-  const char *field = data.data();
-  auto finish_field = [&](const char *end) {
-    Str s(field, end - field);
-    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
-      s.remove_prefix(1);
-      s.remove_suffix(1);
-      expected_quotes += 2;
+  size_t column = 0, actual_quotes = 0;
+  std::array<const char*,N> ends_of_fields;
+  const char *row_start = data.data();
+  auto finish_row = [&] {
+    if(column!=N) return;
+    const char* start=row_start;
+    size_t expected=0;
+    for(size_t i=0;i<N;++i) {
+      const char* end=ends_of_fields[i];
+      size_t len=end-start;
+      bool quoted=len>=2 && ((start[0]=='"') & (end[-1]=='"'));
+      fields[i]=Str(start+quoted,len-2*quoted);
+      expected+=2*quoted;
+      if(i+1<N) start=end+1;
     }
-    if (column < N)
-      fields[column] = s;
-    ++column;
+    if(expected==actual_quotes) callback(fields);
   };
   for (size_t off = 0; off < data.size(); off += 16) {
     const char *base = data.data() + off;
@@ -158,23 +162,23 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
     while (ends) {
       unsigned at = std::countr_zero(ends);
       ends &= ends - 1;
-      finish_field(base + at);
-      field = base + at + 1;
+      if(column<N) ends_of_fields[column]=base+at;
+      ++column;
       if (base[at] == '\n') {
         unsigned before = (1u << at) - 1;
         actual_quotes += std::popcount(quotes & before);
         quotes &= ~before;
-        if (column == N && expected_quotes == actual_quotes)
-          callback(fields);
-        column = actual_quotes = expected_quotes = 0;
+        finish_row();
+        row_start=base+at+1;
+        column = actual_quotes = 0;
       }
     }
     actual_quotes += std::popcount(quotes);
   }
   if (data.back() != '\n') {
-    finish_field(data.data() + data.size());
-    if (column == N && expected_quotes == actual_quotes)
-      callback(fields);
+    if(column<N) ends_of_fields[column]=data.data()+data.size();
+    ++column;
+    finish_row();
   }
 #else
   scalar_rows<N>(data, callback);
