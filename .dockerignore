@@ -1,5 +1,4 @@
-fixtures/
-dev/
-out/
-*.md
-.git
+**
+!cpp/
+!cpp/**
+!build.sh
