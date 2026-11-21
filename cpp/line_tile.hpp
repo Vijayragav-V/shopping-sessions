@@ -2,6 +2,18 @@
 // Find line endings in small groups; both the delimiter count and all
 // surrounding quotes are checked before a field reaches the event validator.
 #ifdef SHOPPING_X86_CSV
+// Every offset in this view belongs to one already bounded physical line.
+template <size_t N> struct BoundedEventFields {
+  const char *base;
+  std::array<uint8_t, N> first, length;
+  Str operator[](size_t i) const { return {base + first[i], length[i]}; }
+  operator std::array<Str, N>() const {
+    std::array<Str, N> fields;
+    for (size_t i = 0; i < N; ++i)
+      fields[i] = (*this)[i];
+    return fields;
+  }
+};
 inline uint64_t mask_to(unsigned n) {
   return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
 }
@@ -32,7 +44,7 @@ split_known_line(const char *p, size_t len, const char *end, F &fn) {
     get(64, hi, qh);
   if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
     return;
-  std::array<Str, N> fields;
+  BoundedEventFields<N> fields{p, {}, {}};
   unsigned start = 0, wrapped = 0;
   for (unsigned i = 0; i < N; ++i) {
     unsigned cut = unsigned(len);
@@ -48,7 +60,8 @@ split_known_line(const char *p, size_t len, const char *end, F &fn) {
     unsigned width = cut - start;
     bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
     wrapped += 2 * quotes;
-    fields[i] = {p + start + quotes, width - 2 * quotes};
+    fields.first[i] = uint8_t(start + quotes);
+    fields.length[i] = uint8_t(width - 2 * quotes);
     start = cut + 1;
   }
   if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))

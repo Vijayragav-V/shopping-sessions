@@ -20,12 +20,13 @@ struct ExtendedRevision {
 };
 template <class T> using Bins = std::array<std::vector<T>, shards>;
 #include "partition_slab.hpp"
+#include "rev_columns.hpp"
 template <class Layout> struct ScanWorker {
   using EventData = typename Layout::E;
   using ClickData = typename Layout::C;
   using Candidate = RevisionIndex;
   std::vector<ExtendedRevision> extended;
-  PartitionSlab<Candidate> candidates;
+  RevisionColumns<256> candidates;
   PartitionSlab<std::pair<Key, EventData>> events;
   PartitionSlab<std::pair<Key, ClickData>> clicks;
   struct Vertex {
@@ -164,7 +165,7 @@ struct Result {
   ScratchArray<ActiveCampaign> activity;
   ScratchArray<int64_t> spend;
   std::vector<int> active, purchased;
-  std::vector<UserDay> users;
+  std::unique_ptr<UserFile> user_file;
   Totals sparse;
   std::vector<Counts> table;
   int32_t first_day{};
@@ -184,20 +185,6 @@ struct Result {
     if (table.empty())
       return sparse[{campaign, day}];
     return table[size_t(day - first_day) * campaigns + campaign];
-  }
-  void merge_into(Totals &merged) const {
-    auto add = [&](int campaign, int32_t day, const Counts &c) {
-      auto &dest = merged[{campaign, day}];
-      dest.sessions += c.sessions;
-      dest.purchases += c.purchases;
-      dest.revenue += c.revenue;
-      dest.assists += c.assists;
-    };
-    for (auto &[k, c] : sparse)
-      add(k.first, k.second, c);
-    for (size_t i = 0; i < table.size(); ++i)
-      if (table[i].sessions || table[i].assists)
-        add(i % campaigns, first_day + int32_t(i / campaigns), table[i]);
   }
 };
 
@@ -237,7 +224,7 @@ void summarize(Key user, std::span<typename Layout::E> events,
       }
       v = 0;
     }
-    result.users.push_back(daily);
+    result.user_file->append(daily);
     result.purchased.clear();
   };
   auto begin_session = [&](Time start) {
@@ -344,7 +331,6 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
     while (capacity < count + count / 2)
       capacity *= 2;
     MEASURE(dedup);
-    std::vector<uint64_t> best(capacity);
     auto seconds = [&](const Candidate &r, unsigned owner) {
       return r.ingest & 0x80000000u
                  ? workers[owner].extended[r.location].seconds
@@ -359,13 +345,14 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
         w.events[location % shards][location / shards].first.bits = 0;
       }
     };
+    std::vector<uint64_t> best(capacity);
     for (unsigned owner = 0; owner < workers.size(); ++owner) {
       auto &refs = workers[owner].candidates[b];
       // Reserve zero for an empty slot. Six low bits identify one of at most
       // 64 input workers, and the remaining bits locate its immutable revision.
       for (size_t i = 0; i < refs.size(); ++i) {
-        auto &r = refs[i];
-        size_t at = (r.id.hash() / shards) & (capacity - 1);
+        Key key = refs.key(i);
+        size_t at = (key.hash() / shards) & (capacity - 1);
         for (;;) {
           auto code = best[at];
           if (!code) {
@@ -373,8 +360,10 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
             break;
           }
           auto old_owner = unsigned((code - 1) & 63);
-          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
-          if (old.id == r.id) {
+          auto &previous = workers[old_owner].candidates[b];
+          if (previous.key((code - 1) >> 6) == key) {
+            auto old = previous[(code - 1) >> 6];
+            auto r = refs[i];
 #ifdef SHOPPING_DIAGNOSTICS
             ++workers[t].duplicates;
 #endif
@@ -715,18 +704,9 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
           });
           return;
         }
-        rows<7>(events[job].body(), [&](auto &r) {
-          if (r[0].empty())
-            return;
-          Time ingest = ingest_time(r[3]);
-          // Invalid revisions still take part in earliest-ingest selection.
-          Key id = workers[t].pool.encode(r[0], 'e');
-          Event e = validate(r, ingest, cat, window);
-#ifdef SHOPPING_DIAGNOSTICS
-          ++workers[t].revisions;
-          workers[t].valid_events += e.ts != bad;
-#endif
-          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+        // All decoded revisions, including invalid winners, pass through this
+        // writer.
+        auto put = [&](Key id, Key user, Event e, Time ingest) {
           auto &w = workers[t];
           uint64_t location = 0;
           if (user.bits) {
@@ -752,6 +732,47 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
             w.extended.push_back({seconds, location});
           }
           w.candidates[bucket(id)].push_back(ref);
+        };
+        auto generic_event = [&](auto const &r) __attribute__((noinline)) {
+          if (r[0].empty())
+            return;
+          auto &w = workers[t];
+          Time ingest = ingest_time(r[3]);
+          Key id = w.pool.encode(r[0], 'e');
+          Event e = validate(r, ingest, cat, window);
+#ifdef SHOPPING_DIAGNOSTICS
+          ++w.revisions;
+          w.valid_events += e.ts != bad;
+#endif
+          Key user = e.ts == bad ? Key{} : w.pool.encode(r[1], 'u');
+          put(id, user, e, ingest);
+        };
+        rows<7>(events[job].body(), [&](const auto &r) {
+          auto type = r[4], id = r[0], user = r[1];
+          if ((type == "view" || type == "cart") && !r[5].empty() &&
+              id.size() == 9 && user.size() == 9 && id[0] == 'e' &&
+              user[0] == 'u' && sizeof(uintptr_t) == 8 &&
+              std::endian::native == std::endian::little) {
+            // These pairs have the same lossless representation as
+            // KeyPool::encode.
+            auto event_word = little_word(id.data() + 1),
+                 user_word = little_word(user.data() + 1);
+            if (uint8_t(event_word >> 56) - 1u < 127u &&
+                uint8_t(user_word >> 56) - 1u < 127u) {
+              Time ingest = ingest_time(r[3]), ts = timestamp(r[2]);
+              bool good = ts >= window.start && ts < window.end &&
+                          ingest - ts <= day_ms;
+#ifdef SHOPPING_DIAGNOSTICS
+              ++workers[t].revisions;
+              workers[t].valid_events += good;
+#endif
+              put(Key{uintptr_t(permute_key(event_word) << 1)},
+                  good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
+                  Event{good ? ts : bad, 0, 0}, ingest);
+              return;
+            }
+          }
+          generic_event(r);
         });
       });
   timer.mark("concurrent input, raw user partition and revision index");
@@ -769,49 +790,41 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
   resolve_revisions(workers, threads, anchor);
   timer.mark("global event dedup and loser removal");
   std::vector<Result> results(threads);
-  size_t rows_hint =
-      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
-      threads;
-  for (auto &result : results) {
-    result.users.reserve(rows_hint);
-    result.configure(window, cat, threads);
-  }
-  process_people(workers, results, cat, threads, timer, layout);
   fs::create_directories(output / "user_daily");
   fs::create_directories(output / "campaign_daily");
   parallel(results.size(), threads, [&](size_t i, unsigned) {
-    write_users(output / "user_daily" /
-                    ("part-" + std::to_string(i) + ".parquet"),
-                results[i].users);
+    auto &result = results[i];
+    result.configure(window, cat, threads);
+    result.user_file = std::make_unique<UserFile>(
+        output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
   });
+  process_people(workers, results, cat, threads, timer, layout);
+  parallel(results.size(), threads,
+           [&](size_t i, unsigned) { results[i].user_file->close(); });
   std::vector<CampaignDay> campaigns;
-  auto append = [&](size_t id, int32_t day, const Counts &c) {
-    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
+  auto append = [&](size_t id, int32_t day, const Counts &counts) {
+    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, counts});
   };
   const auto &first = results.front();
-  if (!first.table.empty()) {
+  if (first.table.empty()) {
+    Totals merged;
+    for (const auto &part : results)
+      for (const auto &[key, counts] : part.sparse)
+        merged[key].add(counts);
+    for (const auto &[key, counts] : merged)
+      append(key.first, key.second, counts);
+  } else {
     for (size_t start = 0; start < first.table.size();
          start += first.campaigns) {
-      int32_t day = first.first_day + int32_t(start / first.campaigns);
+      const int32_t day = first.first_day + int32_t(start / first.campaigns);
       for (size_t id = 0; id < first.campaigns; ++id) {
-        Counts c{};
-        for (const auto &r : results) {
-          const auto &part = r.table[start + id];
-          c.sessions += part.sessions;
-          c.purchases += part.purchases;
-          c.revenue += part.revenue;
-          c.assists += part.assists;
-        }
-        if (c.sessions || c.assists)
-          append(id, day, c);
+        Counts counts;
+        for (const auto &part : results)
+          counts.add(part.table[start + id]);
+        if (counts.sessions || counts.assists)
+          append(id, day, counts);
       }
     }
-  } else {
-    Totals merged;
-    for (auto &r : results)
-      r.merge_into(merged);
-    for (auto &[key, c] : merged)
-      append(key.first, key.second, c);
   }
   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
   timer.mark("merge and Parquet output");
