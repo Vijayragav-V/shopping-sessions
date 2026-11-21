@@ -45,13 +45,21 @@ inline void write_users(const fs::path &file,
   arrow::StringBuilder user, category;
   arrow::Date32Builder day;
   arrow::Int64Builder sessions, events, revenue;
+  const auto n = static_cast<int64_t>(rows.size());
+  checked(day.Reserve(n));
+  checked(sessions.Reserve(n));
+  checked(events.Reserve(n));
+  checked(revenue.Reserve(n));
+  checked(user.Reserve(n));
+  checked(category.Reserve(n));
+  checked(user.ReserveData(9 * n));
   for (auto &r : rows) {
     std::array<char, 9> buffer;
     checked(user.Append(r.user.user_text(buffer)));
-    checked(day.Append(r.day));
-    checked(sessions.Append(r.sessions));
-    checked(events.Append(r.events));
-    checked(revenue.Append(r.revenue));
+    day.UnsafeAppend(r.day);
+    sessions.UnsafeAppend(r.sessions);
+    events.UnsafeAppend(r.events);
+    revenue.UnsafeAppend(r.revenue);
     checked(r.category ? category.Append(*r.category) : category.AppendNull());
   }
   write_table(

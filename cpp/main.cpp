@@ -5,7 +5,7 @@
 #include <regex>
 #include <span>
 
-constexpr size_t shards = 128;
+constexpr size_t shards = 512;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
   Time ts;
@@ -265,6 +265,10 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   parallel(events.size() + 1, threads, [&](size_t job, unsigned t) {
     if (job == 0) {
       auto begin = Timer::Clock::now();
+      size_t bytes = 0;
+      for (auto part : links)
+        bytes += part.size();
+      ids.reserve(bytes);
       for (auto part : links)
         rows<2>(part, [&](auto &r) { ids.join(r[0], r[1]); });
       ids.finish();

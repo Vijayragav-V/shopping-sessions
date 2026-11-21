@@ -47,5 +47,7 @@ int main() {
     auto [it, inserted] = seen.emplace(key, stable);
     assert(inserted || it->second == stable);
     assert(seen.at(second.encode(stable, 'u')) == stable);
+    const auto &peer = names[rng() % names.size()];
+    assert(key.user_less(second.encode(peer, 'u')) == (stable < peer));
   }
 }

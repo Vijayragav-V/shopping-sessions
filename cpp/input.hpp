@@ -133,22 +133,18 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
   if (data.empty())
     return;
   std::array<Str, N> fields;
-  size_t column = 0, actual_quotes = 0;
-  std::array<const char*,N> ends_of_fields;
-  const char *row_start = data.data();
-  auto finish_row = [&] {
-    if(column!=N) return;
-    const char* start=row_start;
-    size_t expected=0;
-    for(size_t i=0;i<N;++i) {
-      const char* end=ends_of_fields[i];
-      size_t len=end-start;
-      bool quoted=len>=2 && ((start[0]=='"') & (end[-1]=='"'));
-      fields[i]=Str(start+quoted,len-2*quoted);
-      expected+=2*quoted;
-      if(i+1<N) start=end+1;
+  size_t column = 0, expected_quotes = 0, actual_quotes = 0;
+  const char *field = data.data();
+  auto finish_field = [&](const char *end) {
+    Str s(field, end - field);
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') {
+      s.remove_prefix(1);
+      s.remove_suffix(1);
+      expected_quotes += 2;
     }
-    if(expected==actual_quotes) callback(fields);
+    if (column < N)
+      fields[column] = s;
+    ++column;
   };
   for (size_t off = 0; off < data.size(); off += 16) {
     const char *base = data.data() + off;
@@ -162,23 +158,23 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
     while (ends) {
       unsigned at = std::countr_zero(ends);
       ends &= ends - 1;
-      if(column<N) ends_of_fields[column]=base+at;
-      ++column;
+      finish_field(base + at);
+      field = base + at + 1;
       if (base[at] == '\n') {
         unsigned before = (1u << at) - 1;
         actual_quotes += std::popcount(quotes & before);
         quotes &= ~before;
-        finish_row();
-        row_start=base+at+1;
-        column = actual_quotes = 0;
+        if (column == N && expected_quotes == actual_quotes)
+          callback(fields);
+        column = actual_quotes = expected_quotes = 0;
       }
     }
     actual_quotes += std::popcount(quotes);
   }
   if (data.back() != '\n') {
-    if(column<N) ends_of_fields[column]=data.data()+data.size();
-    ++column;
-    finish_row();
+    finish_field(data.data() + data.size());
+    if (column == N && expected_quotes == actual_quotes)
+      callback(fields);
   }
 #else
   scalar_rows<N>(data, callback);
@@ -324,6 +320,12 @@ struct Key {
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
+  bool user_less(Key other) const {
+    if (!indirect() && !other.indirect())
+      return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
+    std::array<char, 9> left, right;
+    return user_text(left) < other.user_text(right);
+  }
 };
 struct KeyHash {
   size_t operator()(Key k) const { return k.hash(); }
@@ -356,9 +358,15 @@ struct Identities {
   };
   std::vector<Slot> slots = std::vector<Slot>(256);
   std::vector<int> parent, sizes;
-  std::vector<Str> names;
   std::vector<Key> canonical;
   KeyPool pool;
+  void reserve(size_t input_bytes) {
+    size_t hint = std::min<size_t>(input_bytes / 18, 4'000'000);
+    slots.resize(std::max<size_t>(256, std::bit_ceil(hint + hint / 2 + 1)));
+    parent.reserve(hint);
+    sizes.reserve(hint);
+    canonical.reserve(hint);
+  }
   size_t locate(Key k) const {
     auto i = k.hash() & (slots.size() - 1);
     while (slots[i].key.bits && !(slots[i].key == k))
@@ -379,7 +387,6 @@ struct Identities {
       slot = {key, parent.size()};
       parent.push_back(slot.value);
       sizes.push_back(1);
-      names.push_back(s);
       canonical.push_back(key);
     }
     return slot.value;
@@ -401,8 +408,7 @@ struct Identities {
       std::swap(x, y);
     parent[y] = x;
     sizes[x] += sizes[y];
-    if (names[y] < names[x]) {
-      names[x] = names[y];
+    if (canonical[y].user_less(canonical[x])) {
       canonical[x] = canonical[y];
     }
   }
@@ -412,7 +418,6 @@ struct Identities {
         slot.value = canonical[root(slot.value)].bits;
     std::vector<int>().swap(parent);
     std::vector<int>().swap(sizes);
-    std::vector<Str>().swap(names);
     std::vector<Key>().swap(canonical);
   }
   Key resolve(Key key) const {
