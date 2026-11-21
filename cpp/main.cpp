@@ -6,6 +6,11 @@
 #include <regex>
 #include <span>
 
+template <class Generic, class Common> struct EventCallbacks {
+  Generic generic;
+  Common common;
+  template <class Row> void operator()(const Row &row) { generic(row); }
+};
 size_t bucket(Key k) { return k.hash() % shards; }
 #include "event_layout.hpp"
 struct RevisionIndex {
@@ -21,6 +26,7 @@ struct ExtendedRevision {
 template <class T> using Bins = std::array<std::vector<T>, shards>;
 #include "partition_slab.hpp"
 #include "rev_columns.hpp"
+#include "grouped_control.hpp"
 template <class Layout> struct ScanWorker {
   using EventData = typename Layout::E;
   using ClickData = typename Layout::C;
@@ -331,62 +337,75 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
     while (capacity < count + count / 2)
       capacity *= 2;
     MEASURE(dedup);
-    auto seconds = [&](const Candidate &r, unsigned owner) {
-      return r.ingest & 0x80000000u
-                 ? workers[owner].extended[r.location].seconds
-                 : Time(r.ingest) - Time(1u << 30) + anchor;
-    };
-    auto discard = [&](const Candidate &r, unsigned owner) {
-      auto &w = workers[owner];
-      uint64_t location =
-          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
-      if (location) {
-        --location;
-        w.events[location % shards][location / shards].first.bits = 0;
-      }
-    };
-    std::vector<uint64_t> best(capacity);
-    for (unsigned owner = 0; owner < workers.size(); ++owner) {
-      auto &refs = workers[owner].candidates[b];
-      // Reserve zero for an empty slot. Six low bits identify one of at most
-      // 64 input workers, and the remaining bits locate its immutable revision.
-      for (size_t i = 0; i < refs.size(); ++i) {
-        Key key = refs.key(i);
-        size_t at = (key.hash() / shards) & (capacity - 1);
-        for (;;) {
-          auto code = best[at];
-          if (!code) {
-            best[at] = 1 + (i << 6) + owner;
-            break;
+    auto resolve = [&]<class Value>() {
+      ControlIndex<Value> best(capacity);
+      auto seconds = [&](const Candidate &r, unsigned owner) {
+        return r.ingest & 0x80000000u
+                   ? workers[owner].extended[r.location].seconds
+                   : Time(r.ingest) - Time(1u << 30) + anchor;
+      };
+      auto discard = [&](const Candidate &r, unsigned owner) {
+        auto &w = workers[owner];
+        uint64_t location = r.ingest & 0x80000000u
+                                ? w.extended[r.location].location
+                                : r.location;
+        if (location) {
+          --location;
+          w.events[location % shards][location / shards].first.bits = 0;
+        }
+      };
+      for (unsigned owner = 0; owner < workers.size(); ++owner) {
+        auto &refs = workers[owner].candidates[b];
+        // Reserve zero for an empty slot. Six low bits identify one of at most
+        // 64 input workers, and the remaining bits locate its immutable
+        // revision.
+        for (size_t i = 0; i < refs.size(); ++i) {
+          Key id = refs.key(i);
+          auto hash = id.hash();
+          auto location = 1 + (uint64_t(i) << 6) + owner;
+          auto [slot, found] = best.locate(hash, [&](uint64_t code) {
+            auto prior = code - 1;
+            return workers[prior & 63].candidates[b].key(prior >> 6) == id;
+          });
+          if (!found) {
+            best.insert(slot, hash, location);
+            continue;
           }
-          auto old_owner = unsigned((code - 1) & 63);
-          auto &previous = workers[old_owner].candidates[b];
-          if (previous.key((code - 1) >> 6) == key) {
-            auto old = previous[(code - 1) >> 6];
-            auto r = refs[i];
+          auto prior = best.values[slot] - 1;
+          auto old_owner = unsigned(prior & 63);
+          const auto r = refs[i];
+          const auto old = workers[old_owner].candidates[b][prior >> 6];
 #ifdef SHOPPING_DIAGNOSTICS
-            ++workers[t].duplicates;
+          ++workers[t].duplicates;
 #endif
-            bool before = (r.ingest | old.ingest) & 0x80000000u
-                              ? seconds(r, owner) < seconds(old, old_owner)
-                              : r.ingest < old.ingest;
-            if (before) {
-              discard(old, old_owner);
-              best[at] = 1 + (i << 6) + owner;
-            } else
-              discard(r, owner);
-            break;
-          }
-          at = (at + 1) & (capacity - 1);
+          bool before = (r.ingest | old.ingest) & 0x80000000u
+                            ? seconds(r, owner) < seconds(old, old_owner)
+                            : r.ingest < old.ingest;
+          if (before) {
+            discard(old, old_owner);
+            best.values[slot] = location;
+          } else
+            discard(r, owner);
         }
       }
-    }
+    };
+    // One location contains the revision's offset and its six-bit worker.
+    // Bound the maximum encoded value using the actual shard populations.
+    bool small = std::all_of(workers.begin(), workers.end(), [&](auto &w) {
+      return w.candidates[b].size() <= (UINT32_MAX >> 6);
+    });
+    if (small)
+      resolve.template operator()<uint32_t>();
+    else
+      resolve.template operator()<uint64_t>();
     for (auto &w : workers)
       w.candidates[b].release();
   });
-  for (auto &w : workers)
-    w.candidates.release();
+  // Let the raw grouping pass reclaim the mapped revision pages.
 }
+#define SHOP_REUSE_REGION 1
+#define SHOP_LEND_REGION 1
+#include "timeline_reuse.hpp"
 template <class Layout>
 void process_people(std::vector<ScanWorker<Layout>> &workers,
                     std::vector<Result> &results, const Catalog &cat,
@@ -395,9 +414,18 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
   using Vertex = typename Worker::Vertex;
   using E = typename Layout::E;
   using C = typename Layout::C;
+  std::vector<TimelineRegion> pool(threads);
+  for (unsigned i = 0; i < workers.size(); ++i) {
+    auto &w = workers[i];
+    auto &revision = w.candidates.slab;
+    if (revision.region != MAP_FAILED) {
+      pool[i].base = static_cast<std::byte *>(revision.region);
+      pool[i].bytes = revision.bytes;
+    }
+  }
   struct Store {
-    std::vector<E> events;
-    std::vector<C> clicks;
+    TimelineArray<E> events;
+    TimelineArray<C> clicks;
   };
   std::array<Store, shards> storage;
   std::array<std::vector<Vertex>, shards> vertices;
@@ -478,8 +506,8 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
       typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
           .swap(w.endpoints[b]);
     }
-    store.events.resize(event_count);
-    store.clicks.resize(click_count);
+    store.events.prepare(event_count, pool, t);
+    store.clicks.prepare(click_count, pool, t);
     size_t event_offset = 0, click_offset = 0;
     for (auto &g : groups) {
       auto events_in_group = g.event_end, clicks_in_group = g.click_end;
@@ -501,10 +529,10 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
     }
     event_offset = click_offset = 0;
     for (auto &g : groups) {
-      auto ev = std::span(store.events)
-                    .subspan(event_offset, g.event_end - event_offset);
-      auto cl = std::span(store.clicks)
-                    .subspan(click_offset, g.click_end - click_offset);
+      auto ev =
+          store.events.view().subspan(event_offset, g.event_end - event_offset);
+      auto cl =
+          store.clicks.view().subspan(click_offset, g.click_end - click_offset);
       if (g.vertex) {
         auto &v = nodes[g.vertex - 1];
         v = {g.key, &v, &v, 1, ev, cl};
@@ -519,6 +547,22 @@ void process_people(std::vector<ScanWorker<Layout>> &workers,
     w.clicks.release();
   }
   timer.mark("raw user grouping, link endpoints and singleton sessions");
+  if (std::getenv("SHOP_RECYCLE_TRACE")) {
+    size_t assigned = 0, heap = 0;
+    for (auto &store : storage) {
+      auto count = [&](auto &entries) {
+        size_t n = entries.size * sizeof(*entries.data);
+        assigned += n;
+        if (entries.owned)
+          heap += n;
+      };
+      count(store.events);
+      count(store.clicks);
+    }
+    std::cerr << "SHOP_TIMELINE_REUSE " << assigned - heap << " " << heap
+              << "\n";
+  }
+
   // Roots move strictly downward in bytewise order. Path splitting keeps long
   // chains short even while other edge workers are linking components.
   auto root = [](Vertex *v) {
@@ -668,113 +712,115 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
     w.clicks.reserve(click_hint);
   }
   const Time anchor = window.start / 1000;
-  parallel(
-      links.size() + events.size() + clicks.size(), threads,
-      [&](size_t job, unsigned t) {
-        if (job < links.size()) {
-          auto &w = workers[t];
-          rows<2>(links[job].body(), [&](auto &r) {
-            if (r[0].empty() || r[1].empty())
-              return;
-            size_t index = w.edges.size() * 2;
-            w.edges.push_back({});
-            for (unsigned side = 0; side < 2; ++side) {
-              Key key = w.pool.encode(r[side], 'u');
-              w.endpoints[key.hash() % shards].emplace_back(key, index + side);
-            }
-          });
-          return;
-        }
-        job -= links.size();
-        if (job >= events.size()) {
-          rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
-            if (r[0].empty() || r[1].empty())
-              return;
-            Time ts = timestamp(r[3]);
-            auto c = cat.campaign.find(r[2]);
-            if (ts < window.start - reach || ts >= window.end || c < 0)
-              return;
-            auto alias = workers[t].pool.encode(r[1], 'u');
+  parallel(links.size() + events.size() + clicks.size(), threads,
+           [&](size_t job, unsigned t) {
+             if (job < links.size()) {
+               auto &w = workers[t];
+               rows<2>(links[job].body(), [&](auto &r) {
+                 if (r[0].empty() || r[1].empty())
+                   return;
+                 size_t index = w.edges.size() * 2;
+                 w.edges.push_back({});
+                 for (unsigned side = 0; side < 2; ++side) {
+                   Key key = w.pool.encode(r[side], 'u');
+                   w.endpoints[key.hash() % shards].emplace_back(key,
+                                                                 index + side);
+                 }
+               });
+               return;
+             }
+             job -= links.size();
+             if (job >= events.size()) {
+               rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
+                 if (r[0].empty() || r[1].empty())
+                   return;
+                 Time ts = timestamp(r[3]);
+                 auto c = cat.campaign.find(r[2]);
+                 if (ts < window.start - reach || ts >= window.end || c < 0)
+                   return;
+                 auto alias = workers[t].pool.encode(r[1], 'u');
 #ifdef SHOPPING_DIAGNOSTICS
-            ++workers[t].valid_clicks;
+                 ++workers[t].valid_clicks;
 #endif
-            workers[t].clicks[alias.hash() % shards].emplace_back(
-                Key{alias.bits},
-                layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
-          });
-          return;
-        }
-        // All decoded revisions, including invalid winners, pass through this
-        // writer.
-        auto put = [&](Key id, Key user, Event e, Time ingest) {
-          auto &w = workers[t];
-          uint64_t location = 0;
-          if (user.bits) {
-            size_t b = user.hash() % shards;
-            auto &rows = w.events[b];
-            location = uint64_t(rows.size()) * shards + b + 1;
-            rows.emplace_back(Key{user.bits}, layout.pack(e));
-          }
-          Time seconds = ingest / 1000;
-          Time relative = seconds - anchor;
-          // Bias signed seconds into 31 bits. The high bit selects the overflow
-          // vector.
-          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
-          Candidate ref{id, 0, 0};
-          if (when < 0x80000000ULL && location <= UINT32_MAX) {
-            ref.ingest = uint32_t(when);
-            ref.location = uint32_t(location);
-          } else {
-            if (w.extended.size() > UINT32_MAX)
-              throw std::length_error("revision index exhausted");
-            ref.ingest = 0x80000000u;
-            ref.location = uint32_t(w.extended.size());
-            w.extended.push_back({seconds, location});
-          }
-          w.candidates[bucket(id)].push_back(ref);
-        };
-        auto generic_event = [&](auto const &r) __attribute__((noinline)) {
-          if (r[0].empty())
-            return;
-          auto &w = workers[t];
-          Time ingest = ingest_time(r[3]);
-          Key id = w.pool.encode(r[0], 'e');
-          Event e = validate(r, ingest, cat, window);
+                 workers[t].clicks[alias.hash() % shards].emplace_back(
+                     Key{alias.bits},
+                     layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
+               });
+               return;
+             }
+             auto put = [&](Key id, Key user, Event e, Time ingest) {
+               auto &w = workers[t];
+               uint64_t location = 0;
+               if (user.bits) {
+                 size_t b = user.hash() % shards;
+                 auto &rows = w.events[b];
+                 location = uint64_t(rows.size()) * shards + b + 1;
+                 rows.emplace_back(Key{user.bits}, layout.pack(e));
+               }
+               Time seconds = ingest / 1000;
+               Time relative = seconds - anchor;
+               // Bias signed seconds into 31 bits. The high bit selects the
+               // overflow vector.
+               uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+               Candidate ref{id, 0, 0};
+               if (when < 0x80000000ULL && location <= UINT32_MAX) {
+                 ref.ingest = uint32_t(when);
+                 ref.location = uint32_t(location);
+               } else {
+                 if (w.extended.size() > UINT32_MAX)
+                   throw std::length_error("revision index exhausted");
+                 ref.ingest = 0x80000000u;
+                 ref.location = uint32_t(w.extended.size());
+                 w.extended.push_back({seconds, location});
+               }
+               w.candidates[bucket(id)].push_back(ref);
+             };
+             auto generic_event = [&](auto const &r) __attribute__((noinline)) {
+               if (r[0].empty())
+                 return;
+               auto &w = workers[t];
+               Time ingest = ingest_time(r[3]);
+               Key id = w.pool.encode(r[0], 'e');
+               Event e = validate(r, ingest, cat, window);
 #ifdef SHOPPING_DIAGNOSTICS
-          ++w.revisions;
-          w.valid_events += e.ts != bad;
+               ++w.revisions;
+               w.valid_events += e.ts != bad;
 #endif
-          Key user = e.ts == bad ? Key{} : w.pool.encode(r[1], 'u');
-          put(id, user, e, ingest);
-        };
-        rows<7>(events[job].body(), [&](const auto &r) {
-          auto type = r[4], id = r[0], user = r[1];
-          if ((type == "view" || type == "cart") && !r[5].empty() &&
-              id.size() == 9 && user.size() == 9 && id[0] == 'e' &&
-              user[0] == 'u' && sizeof(uintptr_t) == 8 &&
-              std::endian::native == std::endian::little) {
-            // These pairs have the same lossless representation as
-            // KeyPool::encode.
-            auto event_word = little_word(id.data() + 1),
-                 user_word = little_word(user.data() + 1);
-            if (uint8_t(event_word >> 56) - 1u < 127u &&
-                uint8_t(user_word >> 56) - 1u < 127u) {
-              Time ingest = ingest_time(r[3]), ts = timestamp(r[2]);
-              bool good = ts >= window.start && ts < window.end &&
-                          ingest - ts <= day_ms;
+               Key user = e.ts == bad ? Key{} : w.pool.encode(r[1], 'u');
+               put(id, user, e, ingest);
+             };
+             auto common_event = [&](const char *id, unsigned id_width,
+                                     const char *user, unsigned user_width,
+                                     Str event_time, Str arrival) {
+               if constexpr (sizeof(uintptr_t) != 8 ||
+                             std::endian::native != std::endian::little)
+                 return false;
+               if (id[0] != 'e' || user[0] != 'u')
+                 return false;
+               auto load = [](const char *p, unsigned n) {
+                 const uint64_t mask = UINT64_MAX >> (8 * (9 - n));
+                 return little_word(p + 1) & mask;
+               };
+               auto event_word = load(id, id_width),
+                    user_word = load(user, user_width);
+               if ((event_word | user_word) >> 63 || !id[id_width - 1] ||
+                   !user[user_width - 1])
+                 return false;
+               Time ingest = ingest_time(arrival), ts = timestamp(event_time);
+               bool good = ts >= window.start && ts < window.end &&
+                           ingest - ts <= day_ms;
 #ifdef SHOPPING_DIAGNOSTICS
-              ++workers[t].revisions;
-              workers[t].valid_events += good;
+               ++workers[t].revisions;
+               workers[t].valid_events += good;
 #endif
-              put(Key{uintptr_t(permute_key(event_word) << 1)},
-                  good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
-                  Event{good ? ts : bad, 0, 0}, ingest);
-              return;
-            }
-          }
-          generic_event(r);
-        });
-      });
+               put(Key{uintptr_t(permute_key(event_word) << 1)},
+                   good ? Key{uintptr_t(permute_key(user_word) << 1)} : Key{},
+                   Event{good ? ts : bad, 0, 0}, ingest);
+               return true;
+             };
+             auto callbacks = EventCallbacks{generic_event, common_event};
+             rows<7>(events[job].body(), callbacks);
+           });
   timer.mark("concurrent input, raw user partition and revision index");
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revision_count = 0, revision_capacity = 0;
@@ -799,6 +845,8 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
         output / "user_daily" / ("part-" + std::to_string(i) + ".parquet"));
   });
   process_people(workers, results, cat, threads, timer, layout);
+  for (auto &w : workers)
+    w.candidates.release();
   parallel(results.size(), threads,
            [&](size_t i, unsigned) { results[i].user_file->close(); });
   std::vector<CampaignDay> campaigns;

@@ -2,20 +2,93 @@
 // Find line endings in small groups; both the delimiter count and all
 // surrounding quotes are checked before a field reaches the event validator.
 #ifdef SHOPPING_X86_CSV
-// Every offset in this view belongs to one already bounded physical line.
-template <size_t N> struct BoundedEventFields {
-  const char *base;
-  std::array<uint8_t, N> first, length;
-  Str operator[](size_t i) const { return {base + first[i], length[i]}; }
-  operator std::array<Str, N>() const {
-    std::array<Str, N> fields;
-    for (size_t i = 0; i < N; ++i)
-      fields[i] = (*this)[i];
-    return fields;
-  }
-};
 inline uint64_t mask_to(unsigned n) {
   return n >= 64 ? ~uint64_t{} : (uint64_t{1} << n) - 1;
+}
+struct CsvPrefix {
+  uint64_t commas{}, quotes{}, range{};
+  uint8_t start_id{}, id_width{}, start_user{}, user_width{}, start_time{},
+      time_width{}, count{};
+};
+constexpr auto csv_prefixes() {
+  std::array<std::array<std::array<CsvPrefix, 21>, 7>, 4> table{};
+  for (unsigned ew : {8u, 9u})
+    for (unsigned uw : {8u, 9u})
+      for (unsigned q0 = 0; q0 < 2; ++q0)
+        for (unsigned q1 = 0; q1 < 2; ++q1)
+          for (unsigned q2 = 0; q2 < 2; ++q2)
+            for (unsigned w : {13u, 20u, 25u}) {
+              const unsigned c0 = ew + 2 * q0, c1 = c0 + 1 + uw + 2 * q1,
+                             c2 = c1 + 1 + w + 2 * q2;
+              auto bit = [](unsigned i) { return uint64_t{1} << i; };
+              uint64_t quotes = (q0 ? (bit(0) | bit(c0 - 1)) : 0) |
+                                (q1 ? (bit(c0 + 1) | bit(c1 - 1)) : 0) |
+                                (q2 ? (bit(c1 + 1) | bit(c2 - 1)) : 0);
+              table[c0 - 8][c1 - 17][c2 - 31] = {bit(c0) | bit(c1) | bit(c2),
+                                                 quotes,
+                                                 bit(c2 + 1) - 1,
+                                                 uint8_t(q0),
+                                                 uint8_t(ew),
+                                                 uint8_t(c0 + 1 + q1),
+                                                 uint8_t(uw),
+                                                 uint8_t(c1 + 1 + q2),
+                                                 uint8_t(w),
+                                                 uint8_t(2 * (q0 + q1 + q2))};
+            }
+  return table;
+}
+inline constexpr auto csv_prefix_table = csv_prefixes();
+template <class F>
+__attribute__((target("avx2,bmi,popcnt"), always_inline)) inline bool
+prefix_event(const char *p, unsigned len, uint64_t lo, uint64_t hi, uint64_t ql,
+             uint64_t qh, F &fn) {
+  auto a = lo & (uint64_t{15} << 8), b = lo & (uint64_t{127} << 17),
+       c = lo & (((uint64_t{1} << 21) - 1) << 31);
+  if (!a || !b || !c)
+    return false;
+  unsigned c0 = std::countr_zero(a), c1 = std::countr_zero(b),
+           c2 = std::countr_zero(c);
+  const CsvPrefix &prefix = csv_prefix_table[c0 - 8][c1 - 17][c2 - 31];
+  if (!prefix.range || (lo & prefix.range) != prefix.commas ||
+      (ql & prefix.range) != prefix.quotes)
+    return false;
+  // The kernel is only reached when 128 input bytes remain mapped. Confirm
+  // the candidate delimiter positions against this particular line as well.
+  unsigned s3 = c2 + 1, q3 = p[s3] == '"', c3 = s3 + 20 + 2 * q3, s4 = c3 + 1,
+           q4 = p[s4] == '"', c4 = s4 + 4 + 2 * q4;
+  unsigned c5 = hi ? 127u - std::countl_zero(hi) : 63u - std::countl_zero(lo);
+  if (c4 >= c5 || p[c3] != ',' || p[c4] != ',' || (q3 && p[c3 - 1] != '"') ||
+      (q4 && p[c4 - 1] != '"'))
+    return false;
+  unsigned s5 = c4 + 1, s6 = c5 + 1;
+  bool q5 = (c5 - s5 >= 2) & (p[s5] == '"') & (p[c5 - 1] == '"');
+  bool q6 = (len - s6 >= 2) & (p[s6] == '"') & (p[len - 1] == '"');
+  if (prefix.count + 2 * (q3 + q4 + q5 + q6) !=
+      unsigned(std::popcount(ql) + std::popcount(qh)))
+    return false;
+  const char *id = p + prefix.start_id, *user = p + prefix.start_user,
+             *kind = p + s4 + q4;
+  Str ts{p + prefix.start_time, prefix.time_width}, ingest{p + s3 + q3, 20};
+  unsigned product_length = c5 - s5 - 2 * q5;
+  if constexpr (requires {
+                  fn.common(id, prefix.id_width, user, prefix.user_width, ts,
+                            ingest);
+                }) {
+    if (product_length &&
+        (std::memcmp(kind, "view", 4) == 0 ||
+         std::memcmp(kind, "cart", 4) == 0) &&
+        fn.common(id, prefix.id_width, user, prefix.user_width, ts, ingest))
+      return true;
+  }
+  std::array<Str, 7> fields{Str(id, prefix.id_width),
+                            Str(user, prefix.user_width),
+                            ts,
+                            ingest,
+                            Str(kind, 4),
+                            Str(p + s5 + q5, product_length),
+                            Str(p + s6 + q6, len - s6 - 2 * q6)};
+  fn(fields);
+  return true;
 }
 template <size_t N, class F>
 __attribute__((target("avx2,bmi,popcnt"), always_inline)) inline void
@@ -44,7 +117,10 @@ split_known_line(const char *p, size_t len, const char *end, F &fn) {
     get(64, hi, qh);
   if (size_t(std::popcount(lo) + std::popcount(hi)) != N - 1)
     return;
-  BoundedEventFields<N> fields{p, {}, {}};
+  if constexpr (N == 7)
+    if (prefix_event(p, unsigned(len), lo, hi, ql, qh, fn))
+      return;
+  std::array<Str, N> fields;
   unsigned start = 0, wrapped = 0;
   for (unsigned i = 0; i < N; ++i) {
     unsigned cut = unsigned(len);
@@ -60,8 +136,7 @@ split_known_line(const char *p, size_t len, const char *end, F &fn) {
     unsigned width = cut - start;
     bool quotes = width >= 2 && ((p[start] == '"') & (p[cut - 1] == '"'));
     wrapped += 2 * quotes;
-    fields.first[i] = uint8_t(start + quotes);
-    fields.length[i] = uint8_t(width - 2 * quotes);
+    fields[i] = {p + start + quotes, width - 2 * quotes};
     start = cut + 1;
   }
   if (wrapped == unsigned(std::popcount(ql) + std::popcount(qh)))
