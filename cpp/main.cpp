@@ -233,7 +233,7 @@ void summarize(Key user, std::span<typename Layout::E> events,
       auto &v = result.spend[k];
       if (v > best || (v == best && cat.categories[k] < *daily.category)) {
         best = v;
-        daily.category = cat.categories[k];
+        daily.category = &cat.categories[k];
       }
       v = 0;
     }
@@ -769,8 +769,13 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
   resolve_revisions(workers, threads, anchor);
   timer.mark("global event dedup and loser removal");
   std::vector<Result> results(threads);
-  for (auto &result : results)
+  size_t rows_hint =
+      std::min<size_t>(event_count / 8, (size_t(512) << 20) / sizeof(UserDay)) /
+      threads;
+  for (auto &result : results) {
+    result.users.reserve(rows_hint);
     result.configure(window, cat, threads);
+  }
   process_people(workers, results, cat, threads, timer, layout);
   fs::create_directories(output / "user_daily");
   fs::create_directories(output / "campaign_daily");
@@ -779,13 +784,35 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
                     ("part-" + std::to_string(i) + ".parquet"),
                 results[i].users);
   });
-  Totals merged;
-  for (auto &r : results)
-    r.merge_into(merged);
   std::vector<CampaignDay> campaigns;
-  for (auto &[key, c] : merged)
-    campaigns.push_back(
-        {cat.campaigns[key.first], cat.channels[key.first], key.second, c});
+  auto append = [&](size_t id, int32_t day, const Counts &c) {
+    campaigns.push_back({cat.campaigns[id], cat.channels[id], day, c});
+  };
+  const auto &first = results.front();
+  if (!first.table.empty()) {
+    for (size_t start = 0; start < first.table.size();
+         start += first.campaigns) {
+      int32_t day = first.first_day + int32_t(start / first.campaigns);
+      for (size_t id = 0; id < first.campaigns; ++id) {
+        Counts c{};
+        for (const auto &r : results) {
+          const auto &part = r.table[start + id];
+          c.sessions += part.sessions;
+          c.purchases += part.purchases;
+          c.revenue += part.revenue;
+          c.assists += part.assists;
+        }
+        if (c.sessions || c.assists)
+          append(id, day, c);
+      }
+    }
+  } else {
+    Totals merged;
+    for (auto &r : results)
+      r.merge_into(merged);
+    for (auto &[key, c] : merged)
+      append(key.first, key.second, c);
+  }
   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
   timer.mark("merge and Parquet output");
 #ifdef SHOPPING_DIAGNOSTICS

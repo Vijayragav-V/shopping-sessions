@@ -3,7 +3,7 @@ struct UserDay {
   Key user;
   int32_t day;
   int64_t sessions, events, revenue;
-  std::optional<Str> category;
+  const Str *category{};
 };
 struct Counts {
   int64_t sessions{}, purchases{}, revenue{}, assists{};

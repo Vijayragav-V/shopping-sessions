@@ -147,8 +147,13 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 #endif
 #include "csv_x86.hpp"
 #include "line_csv.hpp"
+#include "line_tile.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #ifdef SHOPPING_X86_CSV
+  if (N == 7 && wide_csv_supported()) {
+    tiled_lines<N, 16>(data, callback);
+    return;
+  }
   if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
   if (wide_csv_supported()) {
     wide_csv_rows<N>(data, callback);
