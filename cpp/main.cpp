@@ -211,12 +211,15 @@ void summarize(Key user, std::span<typename Layout::E> events,
   const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
   {
     MEASURE(sorting);
-    if (!use_bins)
+    if (!use_bins && !std::is_sorted(events.begin(), events.end(),
+          [&](auto a, auto b) { return layout.time(a) < layout.time(b); }))
       std::sort(events.begin(), events.end(),
                 [&](auto a, auto b) { return layout.less(a, b); });
-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
+    auto click_before = [](const auto &a, const auto &b) {
       return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
-    });
+    };
+    if (!std::is_sorted(clicks.begin(), clicks.end(), click_before))
+      std::sort(clicks.begin(), clicks.end(), click_before);
   }
   size_t left = 0, right = 0;
   UserDay daily{user, 0, 0, 0, 0, {}};
