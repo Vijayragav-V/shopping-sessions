@@ -7,7 +7,7 @@ export PYTHONPATH="$assets/starter-pyspark/scripts"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 base=a41989dd4cc92260cce3f5e15e6fd49011cfc256
-first=4d83fa0f8eda106bf507fc2ac9d81f4170059e0d
+first=${TRIAL_START:-4d83fa0f8eda106bf507fc2ac9d81f4170059e0d}
 host=$(lscpu | sed -n 's/^Model name: *//p')
 echo "Host $host; $NCPU vCPUs; boot $(cat /proc/sys/kernel/random/boot_id)"
 "$assets/generate" --seed 1 --events 1000000 --clicks 250000 --threads 2 --output "$work/dev"
@@ -37,14 +37,37 @@ for rev in "$base" "${commits[@]}"; do
   python "$assets/starter-pyspark/scripts/compare.py" "$work/out" "$work/ref"
   rm -rf -- "$work/out"
   python "$dir/tests/parquet_pages.py" "$dir/shopping"
+  for test in input revision_timelines; do
+    c++ -std=c++20 -O2 -pthread "$dir/tests/$test.cpp" -o "$work/unit"
+    "$work/unit"
+  done
   printf 'Gate A %s PASS\n' "$name"
 done
 # A single run of the old binary is only part of a post-change comparison.
 python -u bench.py "$work/input" "${binaries[@]}" --runs 5 --warmup 1 | tee "$work/screen"
-last=${binaries[-1]}
-python -u bench.py "$work/input" "${binaries[0]}" "$last" --runs 11 --warmup 1 | tee "$work/pairs"
-for report in screen pairs; do
-  grep ' median ' "$work/$report" | while read -r binary _ secs; do
-    echo "::notice title=$report::$(basename "$(dirname "$binary")") $secs ($host)"
+for binary in "${binaries[@]:1}"; do
+  id=$(basename "$(dirname "$binary")")
+  python -u bench.py "$work/input" "${binaries[0]}" "$binary" --runs 11 --warmup 1 | tee "$work/pair-$id"
+done
+for report in "$work"/pair-* "$work/screen"; do
+  grep ' median ' "$report" | while read -r binary _ secs; do
+    echo "::notice title=$(basename "$report")::$(basename "$(dirname "$binary")") $secs ($host)"
   done
 done
+# The Rust source uses AVX-512BW/VL unconditionally. Measure parity only
+# where its release binary executes and produces the full reference output.
+if grep -qw avx512vl /proc/cpuinfo && grep -qw avx512bw /proc/cpuinfo; then
+  rust="$work/rust"
+  git init -q "$rust"
+  git -C "$rust" fetch -q --depth 1 https://github.com/Vijayragav-V/buildathon-tests.git 4c136a5866fcb98126b1864029a8a7f8201689eb
+  git -C "$rust" checkout -q --detach FETCH_HEAD
+  docker build --quiet -t shopping-trial:rust "$rust" > /dev/null
+  cid=$(docker create shopping-trial:rust)
+  docker cp "$cid:/pipeline" "$rust/pipeline"
+  docker rm "$cid" >/dev/null
+  "$rust/pipeline" "$work/input" "$work/rust-out"
+  python "$assets/starter-pyspark/scripts/compare.py" "$work/rust-out" "$work/ref"
+  python -u bench.py "$work/input" "$rust/pipeline" "${binaries[-1]}" --runs 11 --warmup 1
+else
+  echo "::notice title=Rust parity::CPU lacks required AVX-512 extensions"
+fi

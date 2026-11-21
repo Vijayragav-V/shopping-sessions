@@ -13,6 +13,8 @@ jobs:
         os: [ubuntu-24.04, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
+    env:
+      TRIAL_START: 6dcd64f8d5dd8f2384a868b692fa60c71456543d
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0, persist-credentials: false}
