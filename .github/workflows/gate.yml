@@ -1,0 +1,39 @@
+name: Shopping Sessions gates
+on:
+  push:
+    branches: ['exp/**', 'verify/**']
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: Verification tier
+        type: choice
+        options: [A, B]
+        default: A
+permissions:
+  contents: read
+  actions: read
+jobs:
+  public:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TIER: ${{ (inputs.gate == 'B' || contains(github.event.head_commit.message, '[gate B]')) && 'B-public' || 'A' }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: ./.github/actions/prepare-gate
+      - name: Run correctness gate
+        run: bash tools/gate.sh "$TIER"
+  scorer:
+    if: success() && (inputs.gate == 'B' || contains(github.event.head_commit.message, '[gate B]'))
+    needs: public
+    runs-on: [self-hosted, linux, x64, scorer-8cpu-24g]
+    timeout-minutes: 60
+    env:
+      TIER: B-scorer
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: ./.github/actions/prepare-gate
+      - name: Verify release image under scorer limits
+        run: bash tools/gate.sh B-scorer

@@ -1,0 +1,14 @@
+name: Prepare Shopping Sessions gate
+description: Install checkers and provision pinned assets, references and generator
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        case "$GITHUB_REF" in refs/heads/exp/*|refs/heads/verify/*) ;; *) echo 'Select an exp/ or verify/ branch'; exit 2;; esac
+        assets=$(mktemp -d "$RUNNER_TEMP/shopping-assets.XXXXXXXX")
+        echo "GATE_ASSETS=$assets" >> "$GITHUB_ENV"
+        python3 -m venv "$assets/venv"
+        "$assets/venv/bin/pip" -q install polars==2.1.0 pyarrow==21.0.0
+        echo "$assets/venv/bin" >> "$GITHUB_PATH"
+        GATE_ASSETS="$assets" bash tools/prepare-gate.sh
