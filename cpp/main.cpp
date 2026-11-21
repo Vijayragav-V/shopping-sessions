@@ -43,7 +43,28 @@ struct Click {
   Str id;
   Time ts;
   int32_t campaign;
+  static Click make(KeyPool &, Str id, Time ts, int campaign, Time) {
+    return {id, ts, campaign};
+  }
+  Time time(Time) const { return ts; }
+  bool operator<(const Click &b) const {
+    return ts == b.ts ? id > b.id : ts < b.ts;
+  }
 };
+struct CompactClick {
+  Key id;
+  uint32_t offset;
+  int32_t campaign;
+  static CompactClick make(KeyPool &pool, Str id, Time ts, int campaign, Time start) {
+    return {pool.encode(id, 'k'), uint32_t(ts - (start - reach)), campaign};
+  }
+  Time time(Time start) const { return start - reach + offset; }
+  bool operator<(const CompactClick &b) const {
+    return offset == b.offset ? b.id.user_less(id, 'k') : offset < b.offset;
+  }
+};
+template<class StoredEvent>
+using ClickFor = std::conditional_t<std::is_same_v<StoredEvent,CompactEvent>, CompactClick, Click>;
 template <class StoredEvent> struct Candidate {
   Key id, user;
   Time ingest;
@@ -105,7 +126,7 @@ template <class T> using Bins = std::array<std::vector<T>, shards>;
 template <class StoredEvent> struct Worker {
   Bins<Candidate<StoredEvent>> candidates;
   Bins<std::pair<Key, StoredEvent>> events;
-  Bins<std::pair<Key, Click>> clicks;
+  Bins<std::pair<Key, ClickFor<StoredEvent>>> clicks;
   KeyPool pool;
 };
 
@@ -369,7 +390,7 @@ std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
 }
 
 template <class StoredEvent>
-void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
+void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<StoredEvent>> clicks,
                Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
@@ -378,9 +399,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
   {
     MEASURE(sorting);
     if (!use_bins) std::sort(events.begin(), events.end());
-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
-      return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
-    });
+    std::sort(clicks.begin(), clicks.end());
   }
   // Exact click copies have no effect on the winner or distinct active
   // campaigns.
@@ -426,7 +445,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
     daily.revenue += revenue;
     {
       MEASURE(attribution);
-      while (right < clicks.size() && clicks[right].ts <= start) {
+      while (right < clicks.size() && clicks[right].time(window_start) <= start) {
         int campaign = clicks[right++].campaign;
         auto &state = result.activity[campaign];
         if (state.count++ == 0) {
@@ -434,7 +453,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
           result.active.push_back(campaign);
         }
       }
-      while (left < right && clicks[left].ts < start - reach) {
+      while (left < right && clicks[left].time(window_start) < start - reach) {
         auto &state = result.activity[clicks[left++].campaign];
         if (--state.count == 0) {
           int moved = result.active.back();
@@ -572,7 +591,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c});
+                                                   ClickFor<StoredEvent>::make(workers[t].pool, r[0], ts, c, window.start));
     });
   });
   timer.mark("click CSV and person partition");
@@ -582,7 +601,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
   parallel(shards, threads, [&](size_t b, unsigned t) {
     std::vector<Group> groups;
     std::vector<StoredEvent> ordered_events;
-    std::vector<Click> ordered_clicks;
+    std::vector<ClickFor<StoredEvent>> ordered_clicks;
     {
       MEASURE(grouping);
       size_t event_count = 0;
@@ -647,7 +666,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   const uint64_t duration = uint64_t(window.end) - uint64_t(window.start);
   // The maximum legal price occupies 24 bits. Index zero is the unknown
   // category, and the final timestamp-offset value is reserved for discards.
-  if (duration <= UINT32_MAX && cat.categories.size() <= 256)
+  if (duration <= UINT32_MAX - reach && cat.categories.size() <= 256)
     process<CompactEvent>(data, output, threads, input, window, cat, timer);
   else
     process<Event>(data, output, threads, input, window, cat, timer);
