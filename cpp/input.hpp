@@ -141,7 +141,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
-template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
+template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
@@ -193,74 +193,6 @@ template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
   scalar_rows<N>(data, callback);
 #endif
 }
-#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
-struct CsvMasks {
-  uint64_t commas, lines, quotes;
-};
-inline CsvMasks csv_masks(const char *p) {
-  auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
-  auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p + 32));
-  auto mask = [&](char c) {
-    auto test = _mm256_set1_epi8(c);
-    auto lo = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, test)));
-    auto hi = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, test)));
-    return uint64_t(lo) | (uint64_t(hi) << 32);
-  };
-  return {mask(','), mask('\n'), mask('"')};
-}
-#endif
-template <size_t N, class F> void parse_rows(Str data, F &&callback) {
-#if defined(__AVX2__) && (defined(__BMI2__) || defined(_MSC_VER))
-  while (data.size() >= 128) {
-    const char *p = data.data();
-    auto first = csv_masks(p);
-    size_t end;
-    uint64_t second_commas = 0;
-    unsigned quotes;
-    if (first.lines) {
-      end = std::countr_zero(first.lines);
-      first.commas = _bzhi_u64(first.commas, end);
-      quotes = std::popcount(_bzhi_u64(first.quotes, end));
-    } else {
-      auto second = csv_masks(p + 64);
-      if (!second.lines) {
-        size_t nl = data.find('\n', 128);
-        size_t len = nl == Str::npos ? data.size() : nl + 1;
-        parse_rows_generic<N>(data.substr(0, len), callback);
-        data.remove_prefix(len);
-        continue;
-      }
-      unsigned n = std::countr_zero(second.lines);
-      second_commas = _bzhi_u64(second.commas, n);
-      quotes = std::popcount(first.quotes) + std::popcount(_bzhi_u64(second.quotes, n));
-      end = 64 + n;
-    }
-    data.remove_prefix(end + 1);
-    if (std::popcount(first.commas) + std::popcount(second_commas) != N - 1)
-      continue;
-    uint8_t stops[N];
-    unsigned column = 0;
-    for (auto m = first.commas; m; m &= m-1)
-      stops[column++] = uint8_t(std::countr_zero(m));
-    for (auto m = second_commas; m; m &= m-1)
-      stops[column++] = uint8_t(64 + std::countr_zero(m));
-    stops[N-1] = uint8_t(end);
-    std::array<Str,N> fields;
-    unsigned start = 0, matched = 0;
-    for (size_t i = 0; i < N; ++i) {
-      unsigned stop = stops[i];
-      unsigned pair = unsigned(stop-start >= 2) & unsigned(p[start] == '"') &
-                      unsigned(p[stop ? stop-1 : 0] == '"');
-      fields[i] = {p+start+pair, stop-start-2*pair};
-      matched += pair;
-      start = stop+1;
-    }
-    if (2*matched == quotes) callback(fields);
-  }
-#endif
-  parse_rows_generic<N>(data, callback);
-}
-
 template <size_t N, class F> void rows(Str data, F &&callback) {
 #ifdef SHOPPING_DIAGNOSTICS
   // Instrument all callbacks in one of every 32 chunks on each worker.
@@ -341,23 +273,6 @@ inline Time midnight(const char *p) {
   return hit.result;
 }
 inline Time timestamp(Str s) {
-#if defined(__AVX2__)
-  if (s.size() == 13) {
-    // Parse the first five digits and last eight without reading past the field.
-    auto first = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(s.data()));
-    auto last = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(s.data()+5));
-    auto bytes = _mm_unpacklo_epi64(first, last);
-    auto digits = _mm_sub_epi8(bytes, _mm_set1_epi8('0'));
-    if (!_mm_testz_si128(_mm_subs_epu8(digits, _mm_set1_epi8(9)),
-                         _mm_set1_epi8(-1)))
-      return bad;
-    auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
-    auto groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
-    int first_five = _mm_cvtsi128_si32(groups)*10 + (s[4]-'0');
-    return Time(first_five)*100000000 + _mm_extract_epi32(groups,2)*10000 +
-           _mm_extract_epi32(groups,3);
-  }
-#endif
   if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
     return number(s, INT64_MAX);
   auto p = s.data();
@@ -403,12 +318,17 @@ struct Key {
   size_t hash() const {
     if (indirect())
       return std::hash<Str>{}(view());
+#if defined(__SSE4_2__) && defined(__x86_64__)
+    auto low = uint32_t(_mm_crc32_u64(0, bits));
+    return (uint64_t(uint32_t(bits >> 1)) << 32) | low;
+#else
     uint64_t n = bits;
     n ^= n >> 30;
     n *= 0xbf58476d1ce4e5b9ULL;
     n ^= n >> 27;
     n *= 0x94d049bb133111ebULL;
     return n ^ (n >> 31);
+#endif
   }
   Str user_text(std::array<char, 9> &buffer) const {
     if (indirect())
