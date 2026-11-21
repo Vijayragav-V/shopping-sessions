@@ -7,38 +7,37 @@
 #include <span>
 
 size_t bucket(Key k) { return k.hash() % shards; }
-struct Event {
-  Time ts;
-  int32_t price, category;
+#include "event_layout.hpp"
+struct RevisionIndex {
+  Key id;
+  uint32_t ingest, location;
 };
-struct Click {
-  Str id;
-  Time ts;
-  int32_t campaign;
-};
-struct Candidate {
-  Key id, user;
-  Time ingest;
-  Event event;
+// Extended entries preserve the full ingest second and row position when
+// either falls outside the compact index. Invalid revisions have location 0.
+struct ExtendedRevision {
+  Time seconds;
+  uint64_t location;
 };
 template <class T> using Bins = std::array<std::vector<T>, shards>;
-struct Worker {
-  Bins<Candidate> candidates;
-  Bins<std::pair<RoutedUser, Event>> events;
-  Bins<std::pair<RoutedUser, Click>> clicks;
-  KeyPool pool;
-  struct CachedRoute {
-    Key key;
-    PersonRoute route;
+#include "partition_slab.hpp"
+template <class Layout> struct ScanWorker {
+  using EventData = typename Layout::E;
+  using ClickData = typename Layout::C;
+  using Candidate = RevisionIndex;
+  std::vector<ExtendedRevision> extended;
+  PartitionSlab<Candidate> candidates;
+  PartitionSlab<std::pair<Key, EventData>> events;
+  PartitionSlab<std::pair<Key, ClickData>> clicks;
+  struct Vertex {
+    Key name;
+    Vertex *parent, *next;
+    size_t weight;
+    std::span<EventData> events;
+    std::span<ClickData> clicks;
   };
-  std::array<CachedRoute, 4096> routes{};
-  PersonRoute route(const Identities &identities, Key key) {
-    auto hash = key.hash();
-    auto &entry = routes[hash % routes.size()];
-    if (!(entry.key == key))
-      entry = {key, identities.route(key, hash)};
-    return entry.route;
-  }
+  std::vector<std::array<Vertex *, 2>> edges;
+  Bins<std::pair<Key, size_t>> endpoints;
+  KeyPool pool;
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
 #endif
@@ -125,8 +124,8 @@ struct Window {
       throw std::runtime_error("invalid manifest window");
   }
 };
-Event validate(const std::array<Str, 7> &r, Time ingest, const Catalog &catalog,
-               Window w) {
+template <class Row>
+Event validate(const Row &r, Time ingest, const Catalog &catalog, Window w) {
   Event drop{bad, 0, 0};
   if (r[1].empty() || r[5].empty())
     return drop;
@@ -156,7 +155,9 @@ template <class T> struct ScratchArray {
 struct ActiveCampaign {
   size_t count{}, slot{};
 };
+#include "session_bins.hpp"
 struct Result {
+  SessionBins bins;
 #ifdef SHOPPING_DIAGNOSTICS
   size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
 #endif
@@ -169,6 +170,7 @@ struct Result {
   int32_t first_day{};
   size_t campaigns{};
   void configure(Window w, const Catalog &cat, unsigned threads) {
+    bins.configure(w);
     size_t count = cat.campaigns.size();
     activity.configure(count);
     spend.configure(cat.categories.size());
@@ -199,8 +201,10 @@ struct Result {
   }
 };
 
-void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
-               const Catalog &cat, Result &result) {
+template <class Layout>
+void summarize(Key user, std::span<typename Layout::E> events,
+               std::span<typename Layout::C> clicks, const Catalog &cat,
+               Result &result, Layout layout) {
   if (events.empty())
     return;
 #ifdef SHOPPING_DIAGNOSTICS
@@ -210,16 +214,16 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
   result.max_events = std::max(result.max_events, events.size());
   result.max_clicks = std::max(result.max_clicks, clicks.size());
 #endif
+  const bool use_bins = !result.bins.cells.empty() && events.size() >= 32;
   {
     MEASURE(sorting);
-    std::sort(events.begin(), events.end(),
-              [](auto a, auto b) { return a.ts < b.ts; });
+    if (!use_bins)
+      std::sort(events.begin(), events.end(),
+                [&](auto a, auto b) { return layout.less(a, b); });
     std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
-      return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
+      return a.ts == b.ts ? b.id.user_less(a.id, 'k') : a.ts < b.ts;
     });
   }
-  // Exact click copies have no effect on the winner or distinct active
-  // campaigns.
   size_t left = 0, right = 0;
   UserDay daily{user, 0, 0, 0, 0, {}};
   auto finish_day = [&] {
@@ -236,35 +240,29 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     result.users.push_back(daily);
     result.purchased.clear();
   };
-  for (size_t i = 0; i < events.size();) {
-    auto start = events[i].ts;
+  auto begin_session = [&](Time start) {
     auto day = utc_day(start);
     if (daily.sessions && day != daily.day) {
       finish_day();
       daily = {user, day, 0, 0, 0, {}};
     }
     daily.day = day;
-    size_t first = i;
-    int64_t revenue = 0;
-    {
-      MEASURE(session);
-      do {
-        auto e = events[i++];
-        if (e.price) {
-          auto &spent = result.spend[e.category];
-          if (!spent)
-            result.purchased.push_back(e.category);
-          spent += e.price;
-          revenue += e.price;
-        }
-      } while (i < events.size() && events[i].ts - events[i - 1].ts <= 1800000);
-    }
+  };
+  auto spend = [&](int category, int64_t price) {
+    auto &value = result.spend[category];
+    if (!value)
+      result.purchased.push_back(category);
+    value += price;
+  };
+  auto end_session = [&](Time start, int64_t count, int64_t revenue) {
+    auto day = daily.day;
     ++daily.sessions;
-    daily.events += i - first;
+    daily.events += count;
     daily.revenue += revenue;
     {
       MEASURE(attribution);
-      while (right < clicks.size() && clicks[right].ts <= start) {
+      while (right < clicks.size() &&
+             layout.click_time(clicks[right]) <= start) {
         int campaign = clicks[right++].campaign;
         auto &state = result.activity[campaign];
         if (state.count++ == 0) {
@@ -272,7 +270,7 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
           result.active.push_back(campaign);
         }
       }
-      while (left < right && clicks[left].ts < start - reach) {
+      while (left < right && layout.click_time(clicks[left]) < start - reach) {
         auto &state = result.activity[clicks[left++].campaign];
         if (--state.count == 0) {
           int moved = result.active.back();
@@ -290,6 +288,31 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     counts.revenue += revenue;
     for (int campaign : result.active)
       ++result.at(campaign, day).assists;
+  };
+  if (use_bins) {
+    MEASURE(session);
+    result.bins.scan(events, begin_session, spend, end_session, layout);
+  } else {
+    size_t i = 0;
+    while (i < events.size()) {
+      Time start = layout.time(events[i]);
+      begin_session(start);
+      size_t first = i;
+      int64_t revenue = 0;
+      {
+        MEASURE(session);
+        do {
+          auto e = layout.unpack(events[i++]);
+          if (e.price) {
+            spend(e.category, e.price);
+            revenue += e.price;
+          }
+        } while (i < events.size() &&
+                 layout.time(events[i]) - layout.time(events[i - 1]) <=
+                     session_gap);
+      }
+      end_session(start, i - first, revenue);
+    }
   }
   finish_day();
   for (int campaign : result.active)
@@ -307,61 +330,431 @@ struct Timer {
     last = now;
   }
 };
-void run(const fs::path &data, const fs::path &output, unsigned threads) {
-  Timer timer;
-  Input input;
-  Window window(input.map(data / "manifest.json"));
-  Catalog cat(input, data);
-  Identities ids;
+template <class Layout>
+void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
+                       unsigned threads, Time anchor) {
+  using Candidate = typename ScanWorker<Layout>::Candidate;
+  parallel(shards, threads, [&](size_t b, [[maybe_unused]] unsigned t) {
+    size_t count = 0;
+    for (auto &w : workers)
+      count += w.candidates[b].size();
+    // The low hash bits selected this shard. Use the remaining bits
+    // for open addressing and compare the original bytes on a hash match.
+    size_t capacity = 1;
+    while (capacity < count + count / 2)
+      capacity *= 2;
+    MEASURE(dedup);
+    std::vector<uint64_t> best(capacity);
+    auto seconds = [&](const Candidate &r, unsigned owner) {
+      return r.ingest & 0x80000000u
+                 ? workers[owner].extended[r.location].seconds
+                 : Time(r.ingest) - Time(1u << 30) + anchor;
+    };
+    auto discard = [&](const Candidate &r, unsigned owner) {
+      auto &w = workers[owner];
+      uint64_t location =
+          r.ingest & 0x80000000u ? w.extended[r.location].location : r.location;
+      if (location) {
+        --location;
+        w.events[location % shards][location / shards].first.bits = 0;
+      }
+    };
+    for (unsigned owner = 0; owner < workers.size(); ++owner) {
+      auto &refs = workers[owner].candidates[b];
+      // Reserve zero for an empty slot. Six low bits identify one of at most
+      // 64 input workers, and the remaining bits locate its immutable revision.
+      for (size_t i = 0; i < refs.size(); ++i) {
+        auto &r = refs[i];
+        size_t at = (r.id.hash() / shards) & (capacity - 1);
+        for (;;) {
+          auto code = best[at];
+          if (!code) {
+            best[at] = 1 + (i << 6) + owner;
+            break;
+          }
+          auto old_owner = unsigned((code - 1) & 63);
+          auto &old = workers[old_owner].candidates[b][(code - 1) >> 6];
+          if (old.id == r.id) {
+#ifdef SHOPPING_DIAGNOSTICS
+            ++workers[t].duplicates;
+#endif
+            bool before = (r.ingest | old.ingest) & 0x80000000u
+                              ? seconds(r, owner) < seconds(old, old_owner)
+                              : r.ingest < old.ingest;
+            if (before) {
+              discard(old, old_owner);
+              best[at] = 1 + (i << 6) + owner;
+            } else
+              discard(r, owner);
+            break;
+          }
+          at = (at + 1) & (capacity - 1);
+        }
+      }
+    }
+    for (auto &w : workers)
+      w.candidates[b].release();
+  });
+  for (auto &w : workers)
+    w.candidates.release();
+}
+template <class Layout>
+void process_people(std::vector<ScanWorker<Layout>> &workers,
+                    std::vector<Result> &results, const Catalog &cat,
+                    unsigned threads, Timer &timer, Layout layout) {
+  using Worker = ScanWorker<Layout>;
+  using Vertex = typename Worker::Vertex;
+  using E = typename Layout::E;
+  using C = typename Layout::C;
+  struct Store {
+    std::vector<E> events;
+    std::vector<C> clicks;
+  };
+  std::array<Store, shards> storage;
+  std::array<std::vector<Vertex>, shards> vertices;
+  parallel(shards, threads, [&](size_t b, unsigned t) {
+    MEASURE(grouping);
+    struct Group {
+      Key key;
+      size_t event_end{}, click_end{};
+      size_t vertex{};
+    };
+    struct Slot {
+      Key key;
+      size_t group;
+    };
+    std::vector<Group> groups;
+    size_t n = 0;
+    for (auto &w : workers)
+      n += w.events[b].size() + w.clicks[b].size();
+    size_t initial = std::bit_ceil(std::clamp<size_t>(n / 12, 128, 65536));
+    std::vector<Slot> slots(initial);
+    auto locate = [&](Key k) {
+      size_t at = (k.hash() / shards) & (slots.size() - 1);
+      while (slots[at].key.bits && !(slots[at].key == k))
+        at = (at + 1) & (slots.size() - 1);
+      return at;
+    };
+    auto intern = [&](Key k) {
+      if (groups.size() * 10 >= slots.size() * 7) {
+        auto old = std::move(slots);
+        slots.clear();
+        slots.resize(old.size() * 2);
+        for (auto &x : old)
+          if (x.key.bits)
+            slots[locate(x.key)] = x;
+      }
+      auto &x = slots[locate(k)];
+      if (!x.key.bits) {
+        x = {k, groups.size()};
+        groups.push_back({k});
+      }
+      return x.group;
+    };
+    // First count each alias, then scatter into disjoint contiguous spans.
+    // A linked person may own spans in several of these raw-user shards.
+    auto &store = storage[b];
+    size_t event_count = 0, click_count = 0;
+    for (auto &w : workers) {
+      for (auto part : w.events[b].spans())
+        for (auto &[u, e] : part) {
+          if (!u.bits) {
+            u.bits = UINTPTR_MAX;
+            continue;
+          }
+          u.bits = intern(Key{u.bits});
+          ++groups[u.bits].event_end;
+          ++event_count;
+        }
+      for (auto part : w.clicks[b].spans())
+        for (auto &[u, c] : part) {
+          u.bits = intern(Key{u.bits});
+          ++groups[u.bits].click_end;
+        }
+      click_count += w.clicks[b].size();
+    }
+    auto &nodes = vertices[b];
+    size_t nv = 0;
+    for (auto &w : workers)
+      for (auto &[key, loc] : w.endpoints[b]) {
+        auto &g = groups[intern(key)];
+        if (!g.vertex)
+          g.vertex = ++nv;
+        key.bits = g.vertex - 1;
+      }
+    nodes.resize(nv);
+    for (auto &w : workers) {
+      for (auto &[key, loc] : w.endpoints[b])
+        w.edges[loc / 2][loc % 2] = &nodes[key.bits];
+      typename std::remove_reference_t<decltype(w.endpoints)>::value_type()
+          .swap(w.endpoints[b]);
+    }
+    store.events.resize(event_count);
+    store.clicks.resize(click_count);
+    size_t event_offset = 0, click_offset = 0;
+    for (auto &g : groups) {
+      auto events_in_group = g.event_end, clicks_in_group = g.click_end;
+      g.event_end = event_offset;
+      g.click_end = click_offset;
+      event_offset += events_in_group;
+      click_offset += clicks_in_group;
+    }
+    for (auto &w : workers) {
+      for (auto part : w.events[b].spans())
+        for (auto &[u, e] : part)
+          if (u.bits != UINTPTR_MAX)
+            store.events[groups[u.bits].event_end++] = e;
+      for (auto part : w.clicks[b].spans())
+        for (auto &[u, c] : part)
+          store.clicks[groups[u.bits].click_end++] = c;
+      w.events[b].release();
+      w.clicks[b].release();
+    }
+    event_offset = click_offset = 0;
+    for (auto &g : groups) {
+      auto ev = std::span(store.events)
+                    .subspan(event_offset, g.event_end - event_offset);
+      auto cl = std::span(store.clicks)
+                    .subspan(click_offset, g.click_end - click_offset);
+      if (g.vertex) {
+        auto &v = nodes[g.vertex - 1];
+        v = {g.key, &v, &v, 1, ev, cl};
+      } else
+        summarize(g.key, ev, cl, cat, results[t], layout);
+      event_offset = g.event_end;
+      click_offset = g.click_end;
+    }
+  });
+  for (auto &w : workers) {
+    w.events.release();
+    w.clicks.release();
+  }
+  timer.mark("raw user grouping, link endpoints and singleton sessions");
+  // Roots move strictly downward in bytewise order. Path splitting keeps long
+  // chains short even while other edge workers are linking components.
+  auto root = [](Vertex *v) {
+    for (;;) {
+      std::atomic_ref<Vertex *> ref(v->parent);
+      auto *p = ref.load(std::memory_order_relaxed);
+      if (v == p)
+        return v;
+      auto *g =
+          std::atomic_ref<Vertex *>(p->parent).load(std::memory_order_relaxed);
+      ref.compare_exchange_weak(p, g, std::memory_order_relaxed);
+      v = p;
+    }
+  };
+  using Edge = std::array<Vertex *, 2>;
+  std::vector<std::span<Edge>> tasks;
+  for (auto &w : workers) {
+    std::span<Edge> edges(w.edges);
+    while (!edges.empty()) {
+      auto n = std::min<size_t>(edges.size(), 4096);
+      tasks.push_back(edges.first(n));
+      edges = edges.subspan(n);
+    }
+  }
+  parallel(tasks.size(), threads, [&](size_t i, unsigned) {
+    for (auto edge : tasks[i]) {
+      auto *x = edge[0], *y = edge[1];
+      for (;;) {
+        x = root(x);
+        y = root(y);
+        if (x == y)
+          break;
+        if (x->name.user_less(y->name))
+          std::swap(x, y);
+        auto *expected = x;
+        if (std::atomic_ref<Vertex *>(x->parent).compare_exchange_weak(
+                expected, y, std::memory_order_relaxed))
+          break;
+      }
+    }
+  });
+  // After the union barrier append every other alias to the root's list.
+  parallel(shards, threads, [&](size_t b, unsigned) {
+    for (auto &v : vertices[b]) {
+      auto *r = root(&v);
+      if (r == &v)
+        continue;
+      auto &head = r->next;
+      v.next = std::atomic_ref<Vertex *>(head).exchange(
+          &v, std::memory_order_relaxed);
+    }
+  });
+  timer.mark("linked components");
+  parallel(shards, threads, [&](size_t b, unsigned t) {
+    std::vector<E> events_buffer;
+    std::vector<C> click_buffer;
+    for (auto &head : vertices[b]) {
+      if (head.parent != &head)
+        continue;
+      std::span<E> ev;
+      std::span<C> cl;
+      size_t event_count = 0, click_count = 0;
+      Vertex *v = &head;
+      do {
+        if (!v->events.empty()) {
+          ev = v->events;
+          event_count += ev.size();
+        }
+        if (!v->clicks.empty()) {
+          cl = v->clicks;
+          click_count += cl.size();
+        }
+        v = v->next;
+      } while (v != &head);
+      if (!event_count)
+        continue;
+      if (event_count > ev.size() || click_count > cl.size()) {
+        bool merge_e = event_count > ev.size(),
+             merge_c = click_count > cl.size();
+        events_buffer.clear();
+        click_buffer.clear();
+        if (merge_e)
+          events_buffer.reserve(event_count);
+        if (merge_c)
+          click_buffer.reserve(click_count);
+        do {
+          if (merge_e)
+            events_buffer.insert(events_buffer.end(), v->events.begin(),
+                                 v->events.end());
+          if (merge_c)
+            click_buffer.insert(click_buffer.end(), v->clicks.begin(),
+                                v->clicks.end());
+          v = v->next;
+        } while (v != &head);
+        if (merge_e)
+          ev = events_buffer;
+        if (merge_c)
+          cl = click_buffer;
+      }
+      summarize(head.name, ev, cl, cat, results[t], layout);
+    }
+  });
+  timer.mark("linked-person sessions, attribution and aggregation");
+}
+
+template <class Layout>
+void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
+                Input &input, Window window, Catalog &cat, Timer &timer,
+                Layout layout) {
+  using Candidate = RevisionIndex;
+  using Worker = ScanWorker<Layout>;
   auto links = input.parts(data / "links");
   timer.mark("catalogs and link mapping");
   std::vector<Worker> workers(threads);
   auto events = input.parts(data / "events");
   timer.mark("map event files");
-  size_t event_bytes = 0;
-  for (auto chunk : events)
-    event_bytes += chunk.size();
-  // A bounded capacity hint only. All vectors grow independently on skew
-  // or unusual row widths. Allow up to 2 GiB total initial storage.
-  auto hint =
-      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Candidate)) /
-      threads / shards;
-  for (auto &worker : workers)
-    for (auto &bin : worker.candidates)
-      bin.reserve(hint);
-  parallel(events.size() + 1, threads, [&](size_t job, unsigned t) {
-    if (job == 0) {
-      auto begin = Timer::Clock::now();
-      size_t bytes = 0;
-      for (auto part : links)
-        bytes += part.size();
-      ids.reserve(bytes);
-      for (auto part : links)
-        rows<2>(part.body(), [&](auto &r) { ids.join(r[0], r[1]); });
-      ids.finish();
-      if (std::getenv("PROFILE"))
-        std::cerr << "linked identities (overlapped) "
-                  << std::chrono::duration<double>(Timer::Clock::now() - begin)
-                         .count()
-                  << " s\n";
-      return;
+  auto clicks = input.parts(data / "clicks");
+  // Sample physical line lengths only to size initial buffers. Skewed shards
+  // and records of any width can grow independently.
+  auto estimate = [](const std::vector<InputChunk> &chunks) {
+    size_t total = 0, sampled = 0, count = 0;
+    for (auto &c : chunks)
+      total += c.size();
+    size_t samples = std::min<size_t>(chunks.size(), 32);
+    for (size_t i = 0; i < samples; ++i) {
+      auto &c = chunks[i * chunks.size() / samples];
+      auto bytes = c.file.substr(c.begin, std::min<size_t>(c.size(), 8192));
+      sampled += bytes.size();
+      count += std::count(bytes.begin(), bytes.end(), '\n');
     }
-    rows<7>(events[job - 1].body(), [&](auto &r) {
-      if (r[0].empty())
-        return;
-      Time ingest = ingest_time(r[3]);
-      // Invalid revisions still take part in earliest-ingest selection.
-      Key id = workers[t].pool.encode(r[0], 'e');
-      Event e = validate(r, ingest, cat, window);
+    return sampled ? size_t(double(total) * count / sampled) : 0;
+  };
+  auto event_count = estimate(events), click_count = estimate(clicks);
+  auto hint = [&](size_t count, size_t row_bytes, size_t budget) {
+    return std::min(count + count / 8, budget / row_bytes) / threads / shards;
+  };
+  auto rev_hint = hint(event_count, sizeof(Candidate), size_t(1536) << 20);
+  auto event_hint =
+      hint(event_count, sizeof(std::pair<Key, typename Layout::E>),
+           size_t(1536) << 20);
+  auto click_hint =
+      hint(click_count, sizeof(std::pair<Key, typename Layout::C>),
+           size_t(768) << 20);
+  for (auto &w : workers) {
+    w.candidates.reserve(rev_hint);
+    w.events.reserve(event_hint);
+    w.clicks.reserve(click_hint);
+  }
+  const Time anchor = window.start / 1000;
+  parallel(
+      links.size() + events.size() + clicks.size(), threads,
+      [&](size_t job, unsigned t) {
+        if (job < links.size()) {
+          auto &w = workers[t];
+          rows<2>(links[job].body(), [&](auto &r) {
+            if (r[0].empty() || r[1].empty())
+              return;
+            size_t index = w.edges.size() * 2;
+            w.edges.push_back({});
+            for (unsigned side = 0; side < 2; ++side) {
+              Key key = w.pool.encode(r[side], 'u');
+              w.endpoints[key.hash() % shards].emplace_back(key, index + side);
+            }
+          });
+          return;
+        }
+        job -= links.size();
+        if (job >= events.size()) {
+          rows<4>(clicks[job - events.size()].body(), [&](auto &r) {
+            if (r[0].empty() || r[1].empty())
+              return;
+            Time ts = timestamp(r[3]);
+            auto c = cat.campaign.find(r[2]);
+            if (ts < window.start - reach || ts >= window.end || c < 0)
+              return;
+            auto alias = workers[t].pool.encode(r[1], 'u');
 #ifdef SHOPPING_DIAGNOSTICS
-      ++workers[t].revisions;
-      workers[t].valid_events += e.ts != bad;
+            ++workers[t].valid_clicks;
 #endif
-      Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
-      workers[t].candidates[bucket(id)].push_back({id, user, ingest, e});
-    });
-  });
-  timer.mark("event CSV, validation and partition");
+            workers[t].clicks[alias.hash() % shards].emplace_back(
+                Key{alias.bits},
+                layout.click(workers[t].pool.encode(r[0], 'k'), ts, c));
+          });
+          return;
+        }
+        rows<7>(events[job].body(), [&](auto &r) {
+          if (r[0].empty())
+            return;
+          Time ingest = ingest_time(r[3]);
+          // Invalid revisions still take part in earliest-ingest selection.
+          Key id = workers[t].pool.encode(r[0], 'e');
+          Event e = validate(r, ingest, cat, window);
+#ifdef SHOPPING_DIAGNOSTICS
+          ++workers[t].revisions;
+          workers[t].valid_events += e.ts != bad;
+#endif
+          Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
+          auto &w = workers[t];
+          uint64_t location = 0;
+          if (user.bits) {
+            size_t b = user.hash() % shards;
+            auto &rows = w.events[b];
+            location = uint64_t(rows.size()) * shards + b + 1;
+            rows.emplace_back(Key{user.bits}, layout.pack(e));
+          }
+          Time seconds = ingest / 1000;
+          Time relative = seconds - anchor;
+          // Bias signed seconds into 31 bits. The high bit selects the overflow
+          // vector.
+          uint64_t when = uint64_t(relative) + (uint64_t{1} << 30);
+          Candidate ref{id, 0, 0};
+          if (when < 0x80000000ULL && location <= UINT32_MAX) {
+            ref.ingest = uint32_t(when);
+            ref.location = uint32_t(location);
+          } else {
+            if (w.extended.size() > UINT32_MAX)
+              throw std::length_error("revision index exhausted");
+            ref.ingest = 0x80000000u;
+            ref.location = uint32_t(w.extended.size());
+            w.extended.push_back({seconds, location});
+          }
+          w.candidates[bucket(id)].push_back(ref);
+        });
+      });
+  timer.mark("concurrent input, raw user partition and revision index");
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revision_count = 0, revision_capacity = 0;
   for (const auto &worker : workers)
@@ -373,138 +766,12 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
             << " used bytes, " << revision_capacity * sizeof(Candidate)
             << " capacity bytes\n";
 #endif
-  parallel(shards, threads, [&](size_t b, unsigned t) {
-    size_t count = 0;
-    for (auto &w : workers)
-      count += w.candidates[b].size();
-    // The low hash bits selected this shard. Use the remaining bits
-    // for open addressing and compare the original bytes on a hash match.
-    size_t capacity = 1;
-    while (capacity < count + count / 2)
-      capacity *= 2;
-    std::vector<Candidate *> best(capacity, nullptr);
-    {
-      MEASURE(dedup);
-      for (auto &w : workers)
-        for (auto &e : w.candidates[b]) {
-          size_t slot = (e.id.hash() / shards) & (capacity - 1);
-          while (best[slot] && !(best[slot]->id == e.id))
-            slot = (slot + 1) & (capacity - 1);
-#ifdef SHOPPING_DIAGNOSTICS
-          workers[t].duplicates += best[slot] != nullptr;
-#endif
-          if (!best[slot])
-            best[slot] = &e;
-          else if (best[slot]->ingest > e.ingest) {
-            best[slot]->event.ts = bad;
-            best[slot] = &e;
-          } else
-            e.event.ts = bad;
-        }
-    }
-    MEASURE(routing);
-    for (auto &w : workers)
-      for (auto &e : w.candidates[b])
-        if (e.event.ts != bad) {
-          auto route = workers[t].route(ids, e.user);
-          workers[t].events[route.shard].emplace_back(route.user, e.event);
-        }
-    for (auto &w : workers)
-      std::vector<Candidate>().swap(w.candidates[b]);
-  });
-  timer.mark("global event dedup and person partition");
-  auto clicks = input.parts(data / "clicks");
-  parallel(clicks.size(), threads, [&](size_t i, unsigned t) {
-    rows<4>(clicks[i].body(), [&](auto &r) {
-      if (r[0].empty() || r[1].empty())
-        return;
-      Time ts = timestamp(r[3]);
-      auto c = cat.campaign.find(r[2]);
-      if (ts < window.start - reach || ts >= window.end || c < 0)
-        return;
-      auto route = workers[t].route(ids, workers[t].pool.encode(r[1], 'u'));
-#ifdef SHOPPING_DIAGNOSTICS
-      ++workers[t].valid_clicks;
-#endif
-      workers[t].clicks[route.shard].emplace_back(route.user,
-                                                  Click{r[0], ts, c});
-    });
-  });
-  timer.mark("click CSV and person partition");
+  resolve_revisions(workers, threads, anchor);
+  timer.mark("global event dedup and loser removal");
   std::vector<Result> results(threads);
   for (auto &result : results)
     result.configure(window, cat, threads);
-  parallel(shards, threads, [&](size_t b, unsigned t) {
-    struct Group {
-      Key user;
-      size_t event_end{}, click_end{};
-    };
-    std::vector<Group> groups;
-    std::vector<Event> ordered_events;
-    std::vector<Click> ordered_clicks;
-    {
-      MEASURE(grouping);
-      std::unordered_map<Key, size_t, KeyHash> singletons;
-      groups.reserve(ids.names[b].size());
-      for (Key name : ids.names[b])
-        groups.push_back({name});
-      for (auto &w : workers) {
-        for (auto &[u, e] : w.events[b]) {
-          if (u.linked()) {
-            u.bits = u.group();
-          } else {
-            Key key{u.bits};
-            auto [it, added] = singletons.try_emplace(key, groups.size());
-            if (added)
-              groups.push_back({key});
-            u.bits = it->second;
-          }
-          ++groups[u.bits].event_end;
-        }
-      }
-      for (auto &w : workers) {
-        for (auto &[u, c] : w.clicks[b]) {
-          if (u.linked()) {
-            auto index = u.group();
-            u.bits = groups[index].event_end ? index : UINTPTR_MAX;
-          } else {
-            auto it = singletons.find(Key{u.bits});
-            u.bits = it == singletons.end() ? UINTPTR_MAX : it->second;
-          }
-          if (u.bits != UINTPTR_MAX)
-            ++groups[u.bits].click_end;
-        }
-      }
-      size_t ne = 0, nc = 0;
-      for (auto &g : groups) {
-        size_t events = g.event_end, clicks = g.click_end;
-        g.event_end = ne;
-        g.click_end = nc;
-        ne += events;
-        nc += clicks;
-      }
-      ordered_events.resize(ne);
-      ordered_clicks.resize(nc);
-      for (auto &w : workers) {
-        for (auto &[u, e] : w.events[b])
-          ordered_events[groups[u.bits].event_end++] = e;
-        for (auto &[u, c] : w.clicks[b])
-          if (u.bits != UINTPTR_MAX)
-            ordered_clicks[groups[u.bits].click_end++] = c;
-        decltype(w.events)::value_type().swap(w.events[b]);
-        decltype(w.clicks)::value_type().swap(w.clicks[b]);
-      }
-    }
-    size_t ep = 0, cp = 0;
-    for (auto &g : groups) {
-      summarize(g.user, std::span(ordered_events).subspan(ep, g.event_end - ep),
-                std::span(ordered_clicks).subspan(cp, g.click_end - cp), cat,
-                results[t]);
-      ep = g.event_end;
-      cp = g.click_end;
-    }
-  });
-  timer.mark("person grouping, sorting, sessions, attribution and aggregation");
+  process_people(workers, results, cat, threads, timer, layout);
   fs::create_directories(output / "user_daily");
   fs::create_directories(output / "campaign_daily");
   parallel(results.size(), threads, [&](size_t i, unsigned) {
@@ -545,6 +812,18 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
             << " events / " << max_clicks << " clicks\n";
   metrics::report();
 #endif
+}
+void run(const fs::path &data, const fs::path &output, unsigned threads) {
+  Timer timer;
+  Input input;
+  Window window(input.map(data / "manifest.json"));
+  Catalog cat(input, data);
+  uint64_t width = uint64_t(window.end) - uint64_t(window.start);
+  if (width <= UINT32_MAX - uint64_t(reach) && cat.categories.size() <= 256)
+    run_layout(data, output, threads, input, window, cat, timer,
+               WordLayout{window.start});
+  else
+    run_layout(data, output, threads, input, window, cat, timer, WideLayout{});
 }
 int main(int argc, char **argv) {
   auto env = [](const char *key, const char *fallback) {

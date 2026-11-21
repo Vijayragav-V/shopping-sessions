@@ -146,8 +146,10 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 }
 #endif
 #include "csv_x86.hpp"
+#include "line_csv.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
 #ifdef SHOPPING_X86_CSV
+  if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
   if (wide_csv_supported()) {
     wide_csv_rows<N>(data, callback);
     return;
@@ -372,19 +374,19 @@ struct Key {
     n *= 0x94d049bb133111ebULL;
     return n ^ (n >> 31);
   }
-  Str user_text(std::array<char, 9> &buffer) const {
+  Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
     if (indirect())
       return view();
     uint64_t n = bits >> 1;
-    buffer[0] = 'u';
+    buffer[0] = prefix;
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
-  bool user_less(Key other) const {
+  bool user_less(Key other, char prefix = 'u') const {
     if (!indirect() && !other.indirect())
       return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
     std::array<char, 9> left, right;
-    return user_text(left) < other.user_text(right);
+    return user_text(left,prefix) < other.user_text(right,prefix);
   }
 };
 struct KeyHash {
@@ -412,107 +414,6 @@ struct KeyPool {
   }
 };
 constexpr size_t shards = 512;
-struct RoutedUser {
-  uintptr_t bits;
-  bool linked() const { return (bits & 3) == 3; }
-  size_t group() const { return bits >> 2; }
-};
-struct PersonRoute {
-  size_t shard;
-  RoutedUser user;
-};
-struct Identities {
-  struct Slot {
-    Key key;
-    uint64_t value{};
-  };
-  std::vector<Slot> slots = std::vector<Slot>(256);
-  std::vector<int> parent, sizes;
-  std::vector<Key> canonical;
-  std::array<std::vector<Key>, shards> names;
-  KeyPool pool;
-  void reserve(size_t input_bytes) {
-    size_t hint = std::min<size_t>(input_bytes / 18, 4'000'000);
-    slots.resize(std::max<size_t>(256, std::bit_ceil(hint + hint / 2 + 1)));
-    parent.reserve(hint);
-    sizes.reserve(hint);
-    canonical.reserve(hint);
-  }
-  size_t locate(Key k, size_t hash) const {
-    auto i = hash & (slots.size() - 1);
-    while (slots[i].key.bits && !(slots[i].key == k))
-      i = (i + 1) & (slots.size() - 1);
-    return i;
-  }
-  int id(Str s) {
-    if (parent.size() * 3 >= slots.size() * 2) {
-      auto old = std::move(slots);
-      slots.resize(old.size() * 2);
-      for (auto slot : old)
-        if (slot.key.bits)
-          slots[locate(slot.key, slot.key.hash())] = slot;
-    }
-    auto key = pool.encode(s, 'u');
-    auto &slot = slots[locate(key, key.hash())];
-    if (!slot.key.bits) {
-      slot = {key, parent.size()};
-      parent.push_back(slot.value);
-      sizes.push_back(1);
-      canonical.push_back(key);
-    }
-    return slot.value;
-  }
-  int root(int x) {
-    while (parent[x] != x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  }
-  void join(Str a, Str b) {
-    if (a.empty() || b.empty())
-      return;
-    int x = root(id(a)), y = root(id(b));
-    if (x == y)
-      return;
-    if (sizes[x] < sizes[y])
-      std::swap(x, y);
-    parent[y] = x;
-    sizes[x] += sizes[y];
-    if (canonical[y].user_less(canonical[x])) {
-      canonical[x] = canonical[y];
-    }
-  }
-  void finish() {
-    // Give every linked component a permanent position within its output
-    // shard. Rows from any alias can go straight to that group's counters.
-    for (size_t i = 0; i < parent.size(); ++i) {
-      if (size_t(parent[i]) != i)
-        continue;
-      auto &shard_names = names[canonical[i].hash() % shards];
-      sizes[i] = static_cast<int>(shard_names.size());
-      shard_names.push_back(canonical[i]);
-    }
-    for (auto &slot : slots)
-      if (slot.key.bits) {
-        int r = root(slot.value);
-        slot.value = uint64_t(sizes[r]) * shards + canonical[r].hash() % shards;
-      }
-    std::vector<int>().swap(parent);
-    std::vector<int>().swap(sizes);
-    std::vector<Key>().swap(canonical);
-  }
-  PersonRoute route(Key key, size_t hash) const {
-    const auto &slot = slots[locate(key, hash)];
-    if (!slot.key.bits)
-      return {hash % shards, {key.bits}};
-    // Inline keys end in 0, borrowed string pointers in 01. The remaining
-    // tag carries a dense index until the counting pass consumes it.
-    return {size_t(slot.value % shards),
-            {uintptr_t(slot.value / shards) * 4 + 3}};
-  }
-};
-
 template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {
   std::atomic<size_t> next{0};
   std::exception_ptr error;

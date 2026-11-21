@@ -42,19 +42,17 @@ The result is written as Parquet files under:
 
 ## Native development build
 
-The native build expects Python 3 with `pyarrow==21.0.0`; the build script links against the Arrow and Parquet libraries bundled in that wheel.
+The executable builds with a C++20 compiler on Linux or macOS. The test suite uses Polars and PyArrow to compare and independently read the Parquet files.
 
 ```sh
-python3 -m pip install pyarrow==21.0.0
 sh build.sh
 DATA_DIR=dev OUTPUT_DIR=output NCPU=8 ./build/shopping
 ```
 
 ## Implementation notes
 
-- Memory-mapped, SIMD-assisted CSV parsing
-- Exact linked-identity resolution
-- Sharded event deduplication and person grouping
-- Parallel sessionization and campaign attribution
-- Direct Arrow/Parquet output
+Workers parse events, clicks and identity links into partitions. Every CSV-valid event revision with an ID enters the global earliest-ingest comparison, including revisions that fail semantic validation. A losing revision invalidates its own raw event slot. Link endpoints and surviving records share the same exact byte-key groups. A parallel union finds the smallest alias in each connected component, including link-only aliases.
 
+Short person timelines use a chronological sort. For dense timelines, half-hour bins keep their first and last milliseconds, event counts and purchases. The gap between adjacent occupied bins decides whether their events belong to the same session. Wide manifest windows and large catalogs retain full time and category widths. The writer emits the two flat Parquet tables directly.
+
+The native comparisons, resource limits and correctness checks are recorded in [BENCHMARKS.md](BENCHMARKS.md).
