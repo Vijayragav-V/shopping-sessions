@@ -141,7 +141,7 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
-template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+template <size_t N, class F> void parse_rows_generic(Str data, F &&callback) {
 #if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
@@ -193,6 +193,78 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
   scalar_rows<N>(data, callback);
 #endif
 }
+#if defined(__AVX2__)
+template <size_t N, class F> void indexed_tile(Str block, F &callback) {
+  // Offset lists are bounded by the number of input bytes.
+  uint16_t stops[4096], lines[4096], quotes_in_line[4096];
+  unsigned fields = 0, rows = 0, quote_count = 0;
+  for (unsigned pos = 0; pos < block.size(); pos += 32) {
+    const char *ptr = block.data() + pos;
+    char tail[32]{};
+    if (block.size() - pos < 32) {
+      std::memcpy(tail, ptr, block.size() - pos);
+      ptr = tail;
+    }
+    auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(ptr));
+    auto equal = [&](char c) { return uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)))); };
+    uint32_t lf = equal('\n'), quotes = equal('"');
+    for (uint32_t ends = lf | equal(','); ends; ends &= ends - 1)
+      stops[fields++] = uint16_t(pos + std::countr_zero(ends));
+    for (; lf; lf &= lf - 1) {
+      uint32_t before = (lf & -lf) - 1;
+      lines[rows] = uint16_t(pos + std::countr_zero(lf));
+      quotes_in_line[rows++] = uint16_t(quote_count + std::popcount(quotes & before));
+      quotes &= ~before;
+      quote_count = 0;
+    }
+    quote_count += std::popcount(quotes);
+  }
+  unsigned first = 0, start = 0;
+  for (unsigned row = 0; row < rows; ++row) {
+    unsigned end = lines[row];
+    if (first + N <= fields && stops[first + N - 1] == end) {
+      std::array<Str, N> values;
+      unsigned pairs = 0;
+      for (unsigned col = 0; col < N; ++col) {
+        unsigned stop = stops[first + col];
+        unsigned size = stop - start;
+        unsigned wrapped = unsigned(size >= 2) & unsigned(block[start] == '"') &
+                           unsigned(block[stop == 0 ? 0 : stop - 1] == '"');
+        values[col] = {block.data() + start + wrapped, size - 2 * wrapped};
+        pairs += wrapped;
+        start = stop + 1;
+      }
+      if (2 * pairs == quotes_in_line[row]) callback(values);
+      first += N;
+    } else {
+      while (first < fields && stops[first] <= end) ++first;
+      start = end + 1;
+    }
+  }
+}
+#endif
+template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+#if defined(__AVX2__)
+  if constexpr (N == 7 || N == 4) {
+    while (!data.empty()) {
+      auto tile = data.substr(0, 4096);
+      size_t last = tile.rfind('\n');
+      if (last == Str::npos) {
+        size_t nl = data.find('\n', tile.size());
+        size_t size = nl == Str::npos ? data.size() : nl + 1;
+        parse_rows_generic<N>(data.substr(0, size), callback);
+        data.remove_prefix(size);
+      } else {
+        indexed_tile<N>(tile.substr(0, last + 1), callback);
+        data.remove_prefix(last + 1);
+      }
+    }
+    return;
+  }
+#endif
+  parse_rows_generic<N>(data, callback);
+}
+
 template <size_t N, class F> void rows(Str data, F &&callback) {
 #ifdef SHOPPING_DIAGNOSTICS
   // Instrument all callbacks in one of every 32 chunks on each worker.

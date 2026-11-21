@@ -537,34 +537,13 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
       count += w.candidates[b].size();
     // The low hash bits selected this shard. Use the remaining bits
     // for open addressing and compare the original bytes on a hash match.
-    // Only IDs whose hash position was visited twice need an exact lookup.
-    // False positives add probes. Every copy of a repeated ID is probed.
-    size_t bits = std::bit_ceil(std::max<size_t>(64, count * 8));
-    std::vector<uint64_t> seen(bits / 64), repeated(bits / 64);
-    size_t collisions = 0;
-    for (auto &w : workers) {
-      for (auto &e : w.candidates[b]) {
-        size_t pos = (e.id.hash() / shards) & (bits - 1);
-        uint64_t mask = uint64_t(1) << (pos % 64);
-        uint64_t &word = seen[pos / 64];
-        if (word & mask) {
-          repeated[pos / 64] |= mask;
-          ++collisions;
-        }
-        word |= mask;
-      }
-    }
-    // Each repeated position has at least one collision. At most two rows
-    // per collision can enter the table, including its first occupant.
-    size_t capacity = std::bit_ceil(std::max<size_t>(2, 3 * collisions));
+    size_t capacity = 1;
+    while (capacity < count + count / 2)
+      capacity *= 2;
     std::vector<Revision *> best(capacity, nullptr);
     for (auto &w : workers)
       for (auto &e : w.candidates[b]) {
-        size_t hash = e.id.hash() / shards;
-        size_t pos = hash & (bits - 1);
-        if (!(repeated[pos / 64] & (uint64_t(1) << (pos % 64))))
-          continue;
-        size_t slot = hash & (capacity - 1);
+        size_t slot = (e.id.hash() / shards) & (capacity - 1);
         while (best[slot] && !(best[slot]->id == e.id))
           slot = (slot + 1) & (capacity - 1);
         if (!best[slot])
