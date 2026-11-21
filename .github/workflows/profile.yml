@@ -1,0 +1,33 @@
+name: Profile and compare C++ pipelines
+on:
+  push:
+    branches: [perf/profile-round2]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare compiler, generator and independent answers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/env"
+          "$RUNNER_TEMP/env/bin/pip" install pyarrow==21.0.0 polars==2.1.0
+          echo "$RUNNER_TEMP/env/bin" >> "$GITHUB_PATH"
+          cd "$RUNNER_TEMP"
+          base=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator.zip dev-answer.zip; do curl -fsSL --retry 3 "$base/$file" -o "$file"; done
+          sha256sum -c <<'SUMS'
+          13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e  generator.zip
+          7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9  dev-answer.zip
+          SUMS
+          unzip -q generator.zip && unzip -q dev-answer.zip
+          rustc --edition 2024 -O generator/src/main.rs -o generate
+      - name: Profile, validate, and time revisions
+        run: python -u .github/perf/lab.py
