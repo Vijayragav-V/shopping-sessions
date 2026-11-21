@@ -1,0 +1,20 @@
+name: Rust migration trials
+on:
+  push:
+    branches: [exp/rust-pipeline]
+    paths: ['cpp/**', 'build.sh', 'tools/migration-trials.sh', '.github/workflows/migration-trials.yml']
+permissions:
+  contents: read
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: ./.github/actions/prepare-gate
+      - run: bash tools/migration-trials.sh
