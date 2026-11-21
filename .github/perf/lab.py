@@ -56,6 +56,7 @@ dev = lab/"dev"
 generate(1,1_000_000,dev)
 for label in labels:
     run(sys.executable,repo/"verify.py",binaries[label],dev,"--answer",tmp/"dev-answer")
+    run(sys.executable,repo/"tests/compact_cases.py",binaries[label])
     note(label+" correctness","36 fixtures and both published dev tables matched")
 for seed, size in sizes:
     data = lab/f"data-{seed}"
