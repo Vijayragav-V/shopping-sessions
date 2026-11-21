@@ -6,10 +6,21 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <new>
 namespace metrics {
-enum Part { grouping, sorting, session, attribution, aggregation, parts };
+enum Part {
+  dedup,
+  routing,
+  grouping,
+  sorting,
+  session,
+  attribution,
+  aggregation,
+  parquet_write,
+  parts
+};
 inline std::atomic<int64_t> totals[parts]{}, alloc_ns{}, alloc_calls{},
     alloc_bytes{};
 inline std::atomic<int64_t> csv_all{}, csv_sampled{}, csv_duration{};
@@ -38,9 +49,21 @@ struct Scope {
   int64_t start = now();
   ~Scope() { local.ns[part] += now() - start; }
 };
+struct alignas(64) WorkerLoad {
+  size_t jobs{};
+  int64_t elapsed{}, cpu{};
+};
+inline int64_t thread_cpu() {
+  timespec now{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+  return int64_t(now.tv_sec) * 1000000000 + now.tv_nsec;
+}
 inline void report() {
-  const char *names[] = {"grouping", "sorting", "session boundaries",
-                         "attribution windows", "aggregation"};
+  const char *names[] = {
+      "event ID dedup",     "person routing and copying",
+      "grouping",           "sorting",
+      "session boundaries", "attribution windows",
+      "aggregation",        "user Parquet encoding and writes"};
   std::cerr << "CSV structural parsing: "
             << (csv_duration + local.csv_ns) * 1e-9 << " sampled worker-s over "
             << csv_sampled + local.csv_sample << " of "

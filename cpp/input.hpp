@@ -30,6 +30,30 @@ using Time = int64_t;
 constexpr Time day_ms = 86400000, reach = 7 * day_ms, bad = INT64_MIN;
 template <class V> using Dict = std::unordered_map<Str, V>;
 
+struct InputChunk {
+  Str file;
+  size_t begin, end;
+  size_t size() const { return end - begin; }
+  Str body() const {
+    size_t first = begin;
+    if (!begin || file[begin - 1] != '\n') {
+      // Skip the header or a row owned by an earlier chunk. Bound this
+      // search so that a long physical line costs linear time overall.
+      size_t lf = file.substr(begin, size()).find('\n');
+      if (lf == Str::npos)
+        return {};
+      first += lf + 1;
+    }
+    if (first == end)
+      return {};
+    size_t last = end;
+    if (end < file.size() && file[end - 1] != '\n') {
+      size_t lf = file.find('\n', end);
+      last = lf == Str::npos ? file.size() : lf + 1;
+    }
+    return file.substr(first, last - first);
+  }
+};
 struct Input {
   std::vector<Str> mappings;
   ~Input() {
@@ -56,22 +80,15 @@ struct Input {
     mappings.emplace_back(static_cast<const char *>(ptr), st.st_size);
     return mappings.back();
   }
-  std::vector<Str> parts(const fs::path &dir) {
-    std::vector<Str> chunks;
+  std::vector<InputChunk> parts(const fs::path &dir) {
+    std::vector<InputChunk> chunks;
+    constexpr size_t block = 512 * 1024;
     for (auto &file : fs::directory_iterator(dir)) {
       if (file.path().extension() != ".csv")
         continue;
       Str data = map(file.path());
-      auto nl = data.find('\n');
-      if (nl == Str::npos)
-        continue;
-      data.remove_prefix(nl + 1);
-      while (!data.empty()) {
-        auto split = data.find('\n', 512 * 1024);
-        auto n = split == Str::npos ? data.size() : split + 1;
-        chunks.push_back(data.substr(0, n));
-        data.remove_prefix(n);
-      }
+      for (size_t off = 0; off < data.size(); off += block)
+        chunks.push_back({data, off, std::min(data.size(), off + block)});
     }
     return chunks;
   }
@@ -128,7 +145,14 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
+#include "csv_x86.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
+#ifdef SHOPPING_X86_CSV
+  if (wide_csv_supported()) {
+    wide_csv_rows<N>(data, callback);
+    return;
+  }
+#endif
 #if defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
@@ -228,6 +252,42 @@ inline int pair_digits(const char *p) {
   unsigned b = unsigned(static_cast<unsigned char>(p[1])) - '0';
   return (a | b) < 16 && a < 10 && b < 10 ? int(10 * a + b) : -1000;
 }
+inline uint64_t little_word(const char *p) {
+  uint64_t word;
+  std::memcpy(&word, p, sizeof(word));
+  if constexpr (std::endian::native == std::endian::big)
+    word = __builtin_bswap64(word);
+  return word;
+}
+inline bool eight_digits(uint64_t word) {
+  const uint64_t digits = word ^ 0x3030303030303030ULL;
+  // Once the high nibbles match ASCII '0', adding six sets bit 4 in
+  // precisely the bytes above nine. No carry reaches another byte.
+  return !(digits & 0xf0f0f0f0f0f0f0f0ULL) &&
+         !((digits + 0x0606060606060606ULL) & 0x1010101010101010ULL);
+}
+inline uint32_t decimal_eight(uint64_t word) {
+  uint64_t digits = word & 0x0f0f0f0f0f0f0f0fULL;
+  uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+  uint64_t quads = (pairs * 100 + (pairs >> 16)) & 0x0000ffff0000ffffULL;
+  return uint32_t(quads) * 10000 + uint32_t(quads >> 32);
+}
+template <bool validate> inline int clock_seconds(const char *clock) {
+  // XOR with "00:00:00" in little-endian byte order. For a valid clock the
+  // separators become zero, and hour, minute and second pairs start at 0,3,6.
+  uint64_t digits = little_word(clock) ^ 0x30303a30303a3030ULL;
+  if constexpr (validate) {
+    if ((digits & 0xf0f0fff0f0fff0f0ULL) ||
+        ((digits + 0x0606000606000606ULL) & 0x1010001010001010ULL))
+      return -1;
+  }
+  uint64_t pairs = digits * 10 + (digits >> 8);
+  int h = uint8_t(pairs), m = uint8_t(pairs >> 24), s = uint8_t(pairs >> 48);
+  if constexpr (validate)
+    if (h > 23 || m > 59 || s > 59)
+      return -1;
+  return (h * 60 + m) * 60 + s;
+}
 inline Time midnight(const char *p) {
   struct CachedDay {
     uint64_t prefix{};
@@ -260,14 +320,18 @@ inline Time midnight(const char *p) {
   return hit.result;
 }
 inline Time timestamp(Str s) {
+  if (s.size() == 13) {
+    auto first = little_word(s.data()), last = little_word(s.data() + 5);
+    if (!eight_digits(first) || !eight_digits(last))
+      return bad;
+    return Time(decimal_eight(first)) * 100000 +
+           decimal_eight(last & ~0xffffffULL);
+  }
   if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
     return number(s, INT64_MAX);
   auto p = s.data();
-  if (s[10] != 'T' || s[13] != ':' || s[16] != ':')
-    return bad;
-  int h = pair_digits(p + 11), minute = pair_digits(p + 14),
-      sec = pair_digits(p + 17);
-  if (unsigned(h) > 23 || unsigned(minute) > 59 || unsigned(sec) > 59)
+  int seconds = clock_seconds<true>(p + 11);
+  if (s[10] != 'T' || seconds < 0)
     return bad;
   int offset = 0;
   if (s.size() == 25) {
@@ -279,18 +343,14 @@ inline Time timestamp(Str s) {
   } else if (p[19] != 'Z')
     return bad;
   auto day = midnight(p);
-  return day == bad ? bad
-                    : day + ((h * 60 + minute - offset) * 60 + sec) * 1000LL;
+  return day == bad ? bad : day + (seconds - offset * 60) * 1000LL;
 }
 inline Time ingest_time(Str s) {
   if (s.size() != 20)
     return timestamp(s);
   // The contract guarantees F1 for ingest_ts.
-  auto pair = [&](size_t i) { return (s[i] - '0') * 10 + s[i + 1] - '0'; };
   auto day = midnight(s.data());
-  return day == bad
-             ? bad
-             : day + ((pair(11) * 60 + pair(14)) * 60 + pair(17)) * 1000LL;
+  return day == bad ? bad : day + clock_seconds<false>(s.data() + 11) * 1000LL;
 }
 // Common identifiers contain a prefix and up to eight suffix bytes. Encode
 // them losslessly inline. Other byte strings refer to stable, borrowed views.
@@ -347,18 +407,29 @@ struct KeyPool {
       }
     }
     other.push_back(s);
-    static_assert(alignof(Str) >= 2);
+    static_assert(alignof(Str) >= 4);
     return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
   }
+};
+constexpr size_t shards = 512;
+struct RoutedUser {
+  uintptr_t bits;
+  bool linked() const { return (bits & 3) == 3; }
+  size_t group() const { return bits >> 2; }
+};
+struct PersonRoute {
+  size_t shard;
+  RoutedUser user;
 };
 struct Identities {
   struct Slot {
     Key key;
-    uintptr_t value{};
+    uint64_t value{};
   };
   std::vector<Slot> slots = std::vector<Slot>(256);
   std::vector<int> parent, sizes;
   std::vector<Key> canonical;
+  std::array<std::vector<Key>, shards> names;
   KeyPool pool;
   void reserve(size_t input_bytes) {
     size_t hint = std::min<size_t>(input_bytes / 18, 4'000'000);
@@ -367,8 +438,8 @@ struct Identities {
     sizes.reserve(hint);
     canonical.reserve(hint);
   }
-  size_t locate(Key k) const {
-    auto i = k.hash() & (slots.size() - 1);
+  size_t locate(Key k, size_t hash) const {
+    auto i = hash & (slots.size() - 1);
     while (slots[i].key.bits && !(slots[i].key == k))
       i = (i + 1) & (slots.size() - 1);
     return i;
@@ -379,10 +450,10 @@ struct Identities {
       slots.resize(old.size() * 2);
       for (auto slot : old)
         if (slot.key.bits)
-          slots[locate(slot.key)] = slot;
+          slots[locate(slot.key, slot.key.hash())] = slot;
     }
     auto key = pool.encode(s, 'u');
-    auto &slot = slots[locate(key)];
+    auto &slot = slots[locate(key, key.hash())];
     if (!slot.key.bits) {
       slot = {key, parent.size()};
       parent.push_back(slot.value);
@@ -413,16 +484,32 @@ struct Identities {
     }
   }
   void finish() {
+    // Give every linked component a permanent position within its output
+    // shard. Rows from any alias can go straight to that group's counters.
+    for (size_t i = 0; i < parent.size(); ++i) {
+      if (size_t(parent[i]) != i)
+        continue;
+      auto &shard_names = names[canonical[i].hash() % shards];
+      sizes[i] = static_cast<int>(shard_names.size());
+      shard_names.push_back(canonical[i]);
+    }
     for (auto &slot : slots)
-      if (slot.key.bits)
-        slot.value = canonical[root(slot.value)].bits;
+      if (slot.key.bits) {
+        int r = root(slot.value);
+        slot.value = uint64_t(sizes[r]) * shards + canonical[r].hash() % shards;
+      }
     std::vector<int>().swap(parent);
     std::vector<int>().swap(sizes);
     std::vector<Key>().swap(canonical);
   }
-  Key resolve(Key key) const {
-    auto slot = slots[locate(key)];
-    return slot.key.bits ? Key{slot.value} : key;
+  PersonRoute route(Key key, size_t hash) const {
+    const auto &slot = slots[locate(key, hash)];
+    if (!slot.key.bits)
+      return {hash % shards, {key.bits}};
+    // Inline keys end in 0, borrowed string pointers in 01. The remaining
+    // tag carries a dense index until the counting pass consumes it.
+    return {size_t(slot.value % shards),
+            {uintptr_t(slot.value / shards) * 4 + 3}};
   }
 };
 
@@ -431,19 +518,49 @@ template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {
   std::exception_ptr error;
   std::mutex lock;
   std::vector<std::jthread> workers;
+#ifdef SHOPPING_DIAGNOSTICS
+  std::vector<metrics::WorkerLoad> loads(std::min<size_t>(threads, jobs));
+#endif
   for (unsigned t = 0; t < std::min<size_t>(threads, jobs); ++t)
     workers.emplace_back([&, t] {
+#ifdef SHOPPING_DIAGNOSTICS
+      auto &load = loads[t];
+      const auto start = metrics::now(), cpu = metrics::thread_cpu();
+#endif
       try {
         for (size_t i;
-             (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs;)
+             (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs;) {
           f(i, t);
+#ifdef SHOPPING_DIAGNOSTICS
+          ++load.jobs;
+#endif
+        }
       } catch (...) {
         std::lock_guard guard(lock);
         error = std::current_exception();
         next.store(jobs);
       }
+#ifdef SHOPPING_DIAGNOSTICS
+      load.elapsed = metrics::now() - start;
+      load.cpu = metrics::thread_cpu() - cpu;
+#endif
     });
   workers.clear();
+#ifdef SHOPPING_DIAGNOSTICS
+  if (!loads.empty()) {
+    double min_s = 1e100, max_s = 0, cpu_s = 0;
+    size_t min_jobs = jobs, max_jobs = 0;
+    for (auto &l : loads) {
+      min_s = std::min(min_s, l.elapsed * 1e-9);
+      max_s = std::max(max_s, l.elapsed * 1e-9);
+      cpu_s += l.cpu * 1e-9;
+      min_jobs = std::min(min_jobs, l.jobs);
+      max_jobs = std::max(max_jobs, l.jobs);
+    }
+    std::cerr << "worker jobs " << min_jobs << ".." << max_jobs << ", active "
+              << min_s << ".." << max_s << " s, CPU " << cpu_s << " s\n";
+  }
+#endif
   if (error)
     std::rethrow_exception(error);
 }

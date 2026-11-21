@@ -34,14 +34,20 @@ inline void write_table(const fs::path &path, std::vector<std::string> names,
     fields.push_back(arrow::field(names[i], columns[i]->type()));
   auto table = arrow::Table::Make(arrow::schema(fields), columns);
   auto file = checked(arrow::io::FileOutputStream::Open(path.string()));
-  auto props =
-      parquet::WriterProperties::Builder().disable_dictionary()->build();
+  parquet::WriterProperties::Builder builder;
+  builder.disable_dictionary()->disable_statistics();
+  for (size_t i = 0; i < names.size(); ++i)
+    if (columns[i]->type_id() == arrow::Type::DATE32 ||
+        columns[i]->type_id() == arrow::Type::INT64)
+      builder.encoding(names[i], parquet::Encoding::DELTA_BINARY_PACKED);
+  auto props = builder.build();
   checked(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), file,
                                      65536, props));
   checked(file->Close());
 }
 inline void write_users(const fs::path &file,
                         const std::vector<UserDay> &rows) {
+  MEASURE(parquet_write);
   arrow::StringBuilder user, category;
   arrow::Date32Builder day;
   arrow::Int64Builder sessions, events, revenue;

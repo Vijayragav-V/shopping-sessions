@@ -1,11 +1,11 @@
 #include "input.hpp"
 #include "metrics.hpp"
 #include "output.hpp"
+#include <climits>
 #include <map>
 #include <regex>
 #include <span>
 
-constexpr size_t shards = 512;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
   Time ts;
@@ -24,12 +24,67 @@ struct Candidate {
 template <class T> using Bins = std::array<std::vector<T>, shards>;
 struct Worker {
   Bins<Candidate> candidates;
-  Bins<std::pair<Key, Event>> events;
-  Bins<std::pair<Key, Click>> clicks;
+  Bins<std::pair<RoutedUser, Event>> events;
+  Bins<std::pair<RoutedUser, Click>> clicks;
   KeyPool pool;
+  struct CachedRoute {
+    Key key;
+    PersonRoute route;
+  };
+  std::array<CachedRoute, 4096> routes{};
+  PersonRoute route(const Identities &identities, Key key) {
+    auto hash = key.hash();
+    auto &entry = routes[hash % routes.size()];
+    if (!(entry.key == key))
+      entry = {key, identities.route(key, hash)};
+    return entry.route;
+  }
+#ifdef SHOPPING_DIAGNOSTICS
+  size_t revisions{}, valid_events{}, duplicates{}, valid_clicks{};
+#endif
 };
 struct Catalog {
-  Dict<int> product, campaign, category;
+  struct IndexedColumn {
+    Dict<int> catalog;
+    Str prefix;
+    std::vector<int> dense;
+    explicit IndexedColumn(Str p) : prefix(p) {}
+    unsigned index(Str key) const {
+      // Only one exact byte spelling can occupy each numeric slot. Padded
+      // IDs, other prefixes and arbitrary text stay in the string dictionary.
+      if (!key.starts_with(prefix))
+        return UINT_MAX;
+      key.remove_prefix(prefix.size());
+      if (key.empty() || key.size() > 9 ||
+          (key.size() > 1 && key.front() == '0'))
+        return UINT_MAX;
+      unsigned i = 0;
+      for (unsigned char c : key) {
+        unsigned d = unsigned(c) - '0';
+        if (d > 9)
+          return UINT_MAX;
+        i = i * 10 + d;
+      }
+      return i;
+    }
+    void build() {
+      dense.assign(std::min<size_t>(catalog.size() * 2 + 1, 1000000), -1);
+      for (const auto &[key, value] : catalog) {
+        auto i = index(key);
+        if (i < dense.size())
+          dense[i] = value;
+      }
+    }
+    int find(Str key) const {
+      unsigned i = index(key);
+      if (i < dense.size())
+        return dense[i];
+      auto it = catalog.find(key);
+      return it == catalog.end() ? -1 : it->second;
+    }
+  };
+  IndexedColumn product{"p"}, campaign{"c_"};
+  Dict<int> category;
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
       channels{"organic"};
   template <class F> void read(Input &input, const fs::path &file, F f) {
@@ -43,13 +98,15 @@ struct Catalog {
       auto [it, added] = category.try_emplace(r[1], categories.size());
       if (added)
         categories.push_back(r[1]);
-      product.emplace(r[0], it->second);
+      product.catalog.emplace(r[0], it->second);
     });
     read(input, dir / "campaigns.csv", [&](auto &r) {
-      campaign.emplace(r[0], campaigns.size());
+      campaign.catalog.emplace(r[0], campaigns.size());
       campaigns.push_back(r[0]);
       channels.push_back(r[1]);
     });
+    product.build();
+    campaign.build();
   }
 };
 struct Window {
@@ -83,8 +140,7 @@ Event validate(const std::array<Str, 7> &r, Time ingest, const Catalog &catalog,
   Time price = number(r[6], 10000000);
   if (price < 1)
     return drop;
-  auto it = catalog.product.find(r[5]);
-  return {ts, int32_t(price), it == catalog.product.end() ? 0 : it->second};
+  return {ts, int32_t(price), std::max(0, catalog.product.find(r[5]))};
 }
 using Totals = std::map<std::pair<int, int32_t>, Counts>;
 int32_t utc_day(Time ts) { return int32_t(ts / day_ms - (ts % day_ms < 0)); }
@@ -101,6 +157,9 @@ struct ActiveCampaign {
   size_t count{}, slot{};
 };
 struct Result {
+#ifdef SHOPPING_DIAGNOSTICS
+  size_t people{}, events_seen{}, clicks_seen{}, max_events{}, max_clicks{};
+#endif
   ScratchArray<ActiveCampaign> activity;
   ScratchArray<int64_t> spend;
   std::vector<int> active, purchased;
@@ -144,6 +203,13 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
                const Catalog &cat, Result &result) {
   if (events.empty())
     return;
+#ifdef SHOPPING_DIAGNOSTICS
+  ++result.people;
+  result.events_seen += events.size();
+  result.clicks_seen += clicks.size();
+  result.max_events = std::max(result.max_events, events.size());
+  result.max_clicks = std::max(result.max_clicks, clicks.size());
+#endif
   {
     MEASURE(sorting);
     std::sort(events.begin(), events.end(),
@@ -251,6 +317,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   timer.mark("catalogs and link mapping");
   std::vector<Worker> workers(threads);
   auto events = input.parts(data / "events");
+  timer.mark("map event files");
   size_t event_bytes = 0;
   for (auto chunk : events)
     event_bytes += chunk.size();
@@ -270,7 +337,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
         bytes += part.size();
       ids.reserve(bytes);
       for (auto part : links)
-        rows<2>(part, [&](auto &r) { ids.join(r[0], r[1]); });
+        rows<2>(part.body(), [&](auto &r) { ids.join(r[0], r[1]); });
       ids.finish();
       if (std::getenv("PROFILE"))
         std::cerr << "linked identities (overlapped) "
@@ -279,18 +346,33 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
                   << " s\n";
       return;
     }
-    rows<7>(events[job - 1], [&](auto &r) {
+    rows<7>(events[job - 1].body(), [&](auto &r) {
       if (r[0].empty())
         return;
       Time ingest = ingest_time(r[3]);
       // Invalid revisions still take part in earliest-ingest selection.
       Key id = workers[t].pool.encode(r[0], 'e');
       Event e = validate(r, ingest, cat, window);
+#ifdef SHOPPING_DIAGNOSTICS
+      ++workers[t].revisions;
+      workers[t].valid_events += e.ts != bad;
+#endif
       Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
       workers[t].candidates[bucket(id)].push_back({id, user, ingest, e});
     });
   });
   timer.mark("event CSV, validation and partition");
+#ifdef SHOPPING_DIAGNOSTICS
+  size_t revision_count = 0, revision_capacity = 0;
+  for (const auto &worker : workers)
+    for (const auto &bin : worker.candidates) {
+      revision_count += bin.size();
+      revision_capacity += bin.capacity();
+    }
+  std::cerr << "revision storage " << revision_count * sizeof(Candidate)
+            << " used bytes, " << revision_capacity * sizeof(Candidate)
+            << " capacity bytes\n";
+#endif
   parallel(shards, threads, [&](size_t b, unsigned t) {
     size_t count = 0;
     for (auto &w : workers)
@@ -301,24 +383,31 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     while (capacity < count + count / 2)
       capacity *= 2;
     std::vector<Candidate *> best(capacity, nullptr);
-    for (auto &w : workers)
-      for (auto &e : w.candidates[b]) {
-        size_t slot = (e.id.hash() / shards) & (capacity - 1);
-        while (best[slot] && !(best[slot]->id == e.id))
-          slot = (slot + 1) & (capacity - 1);
-        if (!best[slot])
-          best[slot] = &e;
-        else if (best[slot]->ingest > e.ingest) {
-          best[slot]->event.ts = bad;
-          best[slot] = &e;
-        } else
-          e.event.ts = bad;
-      }
+    {
+      MEASURE(dedup);
+      for (auto &w : workers)
+        for (auto &e : w.candidates[b]) {
+          size_t slot = (e.id.hash() / shards) & (capacity - 1);
+          while (best[slot] && !(best[slot]->id == e.id))
+            slot = (slot + 1) & (capacity - 1);
+#ifdef SHOPPING_DIAGNOSTICS
+          workers[t].duplicates += best[slot] != nullptr;
+#endif
+          if (!best[slot])
+            best[slot] = &e;
+          else if (best[slot]->ingest > e.ingest) {
+            best[slot]->event.ts = bad;
+            best[slot] = &e;
+          } else
+            e.event.ts = bad;
+        }
+    }
+    MEASURE(routing);
     for (auto &w : workers)
       for (auto &e : w.candidates[b])
         if (e.event.ts != bad) {
-          auto user = ids.resolve(e.user);
-          workers[t].events[bucket(user)].emplace_back(user, e.event);
+          auto route = workers[t].route(ids, e.user);
+          workers[t].events[route.shard].emplace_back(route.user, e.event);
         }
     for (auto &w : workers)
       std::vector<Candidate>().swap(w.candidates[b]);
@@ -326,17 +415,19 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   timer.mark("global event dedup and person partition");
   auto clicks = input.parts(data / "clicks");
   parallel(clicks.size(), threads, [&](size_t i, unsigned t) {
-    rows<4>(clicks[i], [&](auto &r) {
+    rows<4>(clicks[i].body(), [&](auto &r) {
       if (r[0].empty() || r[1].empty())
         return;
       Time ts = timestamp(r[3]);
       auto c = cat.campaign.find(r[2]);
-      if (ts < window.start - reach || ts >= window.end ||
-          c == cat.campaign.end())
+      if (ts < window.start - reach || ts >= window.end || c < 0)
         return;
-      Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
-      workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c->second});
+      auto route = workers[t].route(ids, workers[t].pool.encode(r[1], 'u'));
+#ifdef SHOPPING_DIAGNOSTICS
+      ++workers[t].valid_clicks;
+#endif
+      workers[t].clicks[route.shard].emplace_back(route.user,
+                                                  Click{r[0], ts, c});
     });
   });
   timer.mark("click CSV and person partition");
@@ -353,25 +444,35 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     std::vector<Click> ordered_clicks;
     {
       MEASURE(grouping);
-      std::unordered_map<Key, size_t, KeyHash> ids;
+      std::unordered_map<Key, size_t, KeyHash> singletons;
+      groups.reserve(ids.names[b].size());
+      for (Key name : ids.names[b])
+        groups.push_back({name});
       for (auto &w : workers) {
         for (auto &[u, e] : w.events[b]) {
-          auto [it, added] = ids.try_emplace(u, groups.size());
-          if (added)
-            groups.push_back({u});
-          ++groups[it->second].event_end;
-          u.bits = it->second;
+          if (u.linked()) {
+            u.bits = u.group();
+          } else {
+            Key key{u.bits};
+            auto [it, added] = singletons.try_emplace(key, groups.size());
+            if (added)
+              groups.push_back({key});
+            u.bits = it->second;
+          }
+          ++groups[u.bits].event_end;
         }
       }
       for (auto &w : workers) {
         for (auto &[u, c] : w.clicks[b]) {
-          auto it = ids.find(u);
-          if (it == ids.end())
-            u.bits = UINTPTR_MAX;
-          else {
-            u.bits = it->second;
-            ++groups[it->second].click_end;
+          if (u.linked()) {
+            auto index = u.group();
+            u.bits = groups[index].event_end ? index : UINTPTR_MAX;
+          } else {
+            auto it = singletons.find(Key{u.bits});
+            u.bits = it == singletons.end() ? UINTPTR_MAX : it->second;
           }
+          if (u.bits != UINTPTR_MAX)
+            ++groups[u.bits].click_end;
         }
       }
       size_t ne = 0, nc = 0;
@@ -421,6 +522,27 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
   timer.mark("merge and Parquet output");
 #ifdef SHOPPING_DIAGNOSTICS
+  size_t revisions = 0, valid = 0, duplicates = 0, clicks_kept = 0, people = 0;
+  size_t events_seen = 0, clicks_seen = 0, max_events = 0, max_clicks = 0;
+  for (auto &w : workers) {
+    revisions += w.revisions;
+    valid += w.valid_events;
+    duplicates += w.duplicates;
+    clicks_kept += w.valid_clicks;
+  }
+  for (auto &r : results) {
+    people += r.people;
+    events_seen += r.events_seen;
+    clicks_seen += r.clicks_seen;
+    max_events = std::max(max_events, r.max_events);
+    max_clicks = std::max(max_clicks, r.max_clicks);
+  }
+  std::cerr << "revisions " << revisions << ", valid before dedup " << valid
+            << ", duplicate revisions " << duplicates << ", valid clicks "
+            << clicks_kept << ", active people " << people
+            << ", grouped events " << events_seen << ", grouped clicks "
+            << clicks_seen << ", largest timelines " << max_events
+            << " events / " << max_clicks << " clicks\n";
   metrics::report();
 #endif
 }
