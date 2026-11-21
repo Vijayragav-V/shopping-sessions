@@ -1,4 +1,13 @@
 /.bench/
 /build/
+/dev/
+/dev-answer/
+/generator/
+/out/
+/output/
+/scratch/
+/starter-duckdb/
+/starter-polars/
+/starter-pyspark/
 __pycache__/
 .DS_Store
