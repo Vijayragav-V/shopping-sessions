@@ -43,7 +43,28 @@ struct Click {
   Str id;
   Time ts;
   int32_t campaign;
+  static Click make(KeyPool &, Str id, Time ts, int campaign, Time) {
+    return {id, ts, campaign};
+  }
+  Time time(Time) const { return ts; }
+  bool operator<(const Click &b) const {
+    return ts == b.ts ? id > b.id : ts < b.ts;
+  }
 };
+struct CompactClick {
+  Key id;
+  uint32_t offset;
+  int32_t campaign;
+  static CompactClick make(KeyPool &pool, Str id, Time ts, int campaign, Time start) {
+    return {pool.encode(id, 'k'), uint32_t(ts - (start - reach)), campaign};
+  }
+  Time time(Time start) const { return start - reach + offset; }
+  bool operator<(const CompactClick &b) const {
+    return offset == b.offset ? b.id.user_less(id, 'k') : offset < b.offset;
+  }
+};
+template<class StoredEvent>
+using ClickFor = std::conditional_t<std::is_same_v<StoredEvent,CompactEvent>, CompactClick, Click>;
 template <class StoredEvent> struct Candidate {
   Key id, user;
   Time ingest;
@@ -105,7 +126,7 @@ template <class T> using Bins = std::array<std::vector<T>, shards>;
 template <class StoredEvent> struct Worker {
   Bins<Candidate<StoredEvent>> candidates;
   Bins<std::pair<Key, StoredEvent>> events;
-  Bins<std::pair<Key, Click>> clicks;
+  Bins<std::pair<Key, ClickFor<StoredEvent>>> clicks;
   KeyPool pool;
 };
 
@@ -369,7 +390,7 @@ std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
 }
 
 template <class StoredEvent>
-void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
+void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<StoredEvent>> clicks,
                Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
@@ -378,9 +399,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
   {
     MEASURE(sorting);
     if (!use_bins) std::sort(events.begin(), events.end());
-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
-      return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
-    });
+    std::sort(clicks.begin(), clicks.end());
   }
   // Exact click copies have no effect on the winner or distinct active
   // campaigns.
@@ -426,7 +445,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
     daily.revenue += revenue;
     {
       MEASURE(attribution);
-      while (right < clicks.size() && clicks[right].ts <= start) {
+      while (right < clicks.size() && clicks[right].time(window_start) <= start) {
         int campaign = clicks[right++].campaign;
         auto &state = result.activity[campaign];
         if (state.count++ == 0) {
@@ -434,7 +453,7 @@ void summarize(Key user, std::span<StoredEvent> events, std::span<Click> clicks,
           result.active.push_back(campaign);
         }
       }
-      while (left < right && clicks[left].ts < start - reach) {
+      while (left < right && clicks[left].time(window_start) < start - reach) {
         auto &state = result.activity[clicks[left++].campaign];
         if (--state.count == 0) {
           int moved = result.active.back();
@@ -537,13 +556,34 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
       count += w.candidates[b].size();
     // The low hash bits selected this shard. Use the remaining bits
     // for open addressing and compare the original bytes on a hash match.
-    size_t capacity = 1;
-    while (capacity < count + count / 2)
-      capacity *= 2;
+    // Only IDs whose hash position was visited twice need an exact lookup.
+    // False positives add probes. Every copy of a repeated ID is probed.
+    size_t bits = std::bit_ceil(std::max<size_t>(64, count * 8));
+    std::vector<uint64_t> seen(bits / 64), repeated(bits / 64);
+    size_t collisions = 0;
+    for (auto &w : workers) {
+      for (auto &e : w.candidates[b]) {
+        size_t pos = (e.id.hash() / shards) & (bits - 1);
+        uint64_t mask = uint64_t(1) << (pos % 64);
+        uint64_t &word = seen[pos / 64];
+        if (word & mask) {
+          repeated[pos / 64] |= mask;
+          ++collisions;
+        }
+        word |= mask;
+      }
+    }
+    // Each repeated position has at least one collision. At most two rows
+    // per collision can enter the table, including its first occupant.
+    size_t capacity = std::bit_ceil(std::max<size_t>(2, 3 * collisions));
     std::vector<Revision *> best(capacity, nullptr);
     for (auto &w : workers)
       for (auto &e : w.candidates[b]) {
-        size_t slot = (e.id.hash() / shards) & (capacity - 1);
+        size_t hash = e.id.hash() / shards;
+        size_t pos = hash & (bits - 1);
+        if (!(repeated[pos / 64] & (uint64_t(1) << (pos % 64))))
+          continue;
+        size_t slot = hash & (capacity - 1);
         while (best[slot] && !(best[slot]->id == e.id))
           slot = (slot + 1) & (capacity - 1);
         if (!best[slot])
@@ -572,7 +612,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c});
+                                                   ClickFor<StoredEvent>::make(workers[t].pool, r[0], ts, c, window.start));
     });
   });
   timer.mark("click CSV and person partition");
@@ -582,7 +622,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
   parallel(shards, threads, [&](size_t b, unsigned t) {
     std::vector<Group> groups;
     std::vector<StoredEvent> ordered_events;
-    std::vector<Click> ordered_clicks;
+    std::vector<ClickFor<StoredEvent>> ordered_clicks;
     {
       MEASURE(grouping);
       size_t event_count = 0;
@@ -647,7 +687,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   const uint64_t duration = uint64_t(window.end) - uint64_t(window.start);
   // The maximum legal price occupies 24 bits. Index zero is the unknown
   // category, and the final timestamp-offset value is reserved for discards.
-  if (duration <= UINT32_MAX && cat.categories.size() <= 256)
+  if (duration <= UINT32_MAX - reach && cat.categories.size() <= 256)
     process<CompactEvent>(data, output, threads, input, window, cat, timer);
   else
     process<Event>(data, output, threads, input, window, cat, timer);

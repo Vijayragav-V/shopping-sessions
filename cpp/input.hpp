@@ -23,6 +23,9 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#if defined(__SSE4_2__) && defined(__x86_64__)
+#include <nmmintrin.h>
+#endif
 
 namespace fs = std::filesystem;
 using Str = std::string_view;
@@ -273,23 +276,6 @@ inline Time midnight(const char *p) {
   return hit.result;
 }
 inline Time timestamp(Str s) {
-#if defined(__AVX2__)
-  if (s.size() == 13) {
-    // Parse the first five digits and last eight without reading past the field.
-    auto first = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(s.data()));
-    auto last = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(s.data()+5));
-    auto bytes = _mm_unpacklo_epi64(first, last);
-    auto digits = _mm_sub_epi8(bytes, _mm_set1_epi8('0'));
-    if (!_mm_testz_si128(_mm_subs_epu8(digits, _mm_set1_epi8(9)),
-                         _mm_set1_epi8(-1)))
-      return bad;
-    auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
-    auto groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
-    int first_five = _mm_cvtsi128_si32(groups)*10 + (s[4]-'0');
-    return Time(first_five)*100000000 + _mm_extract_epi32(groups,2)*10000 +
-           _mm_extract_epi32(groups,3);
-  }
-#endif
   if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
     return number(s, INT64_MAX);
   auto p = s.data();
@@ -347,19 +333,19 @@ struct Key {
     return n ^ (n >> 31);
 #endif
   }
-  Str user_text(std::array<char, 9> &buffer) const {
+  Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
     if (indirect())
       return view();
     uint64_t n = bits >> 1;
-    buffer[0] = 'u';
+    buffer[0] = prefix;
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
-  bool user_less(Key other) const {
+  bool user_less(Key other, char prefix = 'u') const {
     if (!indirect() && !other.indirect())
       return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
     std::array<char, 9> left, right;
-    return user_text(left) < other.user_text(right);
+    return user_text(left, prefix) < other.user_text(right, prefix);
   }
 };
 struct KeyHash {
