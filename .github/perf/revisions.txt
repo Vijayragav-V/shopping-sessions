@@ -1,6 +1,6 @@
 baseline c94a3b5
-compact 3cbc9c1fd3245013e8b28f5e0681f02a56fb4282
-csv 7af3263e868dc2f9db61cbbd1456cec53662992f
-route cc9a01f15b91fd9d56eae39a0ca04cb80365075f
-timebins c792c35a9669bcc61b81e612dcfaa8af102c82f4
-combined 5726fd218b51678c5367ce5144a31dc5a7bbb715
+route cc9a01f
+binsroute 2b9b4b9
+row 4629e1d
+decimal 5dea116
+tags 7829352d588cf4eeac7a760d45fe90040c88ecda
