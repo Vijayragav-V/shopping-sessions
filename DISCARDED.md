@@ -7,7 +7,7 @@ Times are seconds unless marked otherwise. The section links identify the implem
 | Extra duplicate-filter scan | 4.753 → 5.287 |
 | Per-worker map of person timelines | 5.337 → 9.829 |
 | Preliminary offset-only exact dedup scan | 4.183 → 4.808 |
-| Block-allocated event candidates | 1.526 → 1.687 (paired control 1.661) |
+| Block-allocated event candidates | 1.661 → 1.687 |
 | Radix-sort long user timelines | 1.418 → 1.466 |
 | Collect all field boundaries before row decoding | 1.373 → 1.505 |
 | Duplicate-table keys alongside winner pointers | 0.911 → 0.968 |

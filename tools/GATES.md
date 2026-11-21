@@ -16,3 +16,7 @@
 | 20M / 60M | Independent historical scored commit `33fb788`; all six original Parquet tables are [recorded as artifacts](https://github.com/Vijayragav-V/shopping-sessions/actions/runs/44921612782). The six canonical SHA-256 fingerprints are in `reference-tables.txt`. |
 | Stored Parquet | Set `GATE_REFERENCES` to a directory containing `23/`, `47/`, `733/` with the extracted reference tables. By default each pair is re-created from the pinned oracle and verified against the original recorded fingerprint before the exact diff. |
 | Resource use | The public job generates and releases one population at a time. Full 60M comparisons sort and compare one day at a time. Gate A timing includes the release build, dataset generation, reference verification and exact comparisons; environment setup is separate. |
+
+| Measured unchanged release | Gate A wall time |
+| --- | ---: |
+| Four-vCPU Linux runner, Docker build through exact 20M diff, source a41989d | [51 seconds](https://github.com/Vijayragav-V/shopping-sessions/actions/runs/44938716183) |
