@@ -339,7 +339,10 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
       capacity *= 2;
     MEASURE(dedup);
     auto resolve = [&]<class Value>() {
-      ControlIndex<Value> best(capacity);
+      // Common event keys get one direct slot. Keep the first occupant there
+      // and resolve every collision by exact equality in a separate index.
+      std::vector<Value> home(capacity);
+      std::optional<ControlIndex<Value>> overflow;
       auto seconds = [&](const Candidate &r, unsigned owner) {
         return r.ingest & 0x80000000u
                    ? workers[owner].extended[r.location].seconds
@@ -364,15 +367,26 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
           Key id = refs.key(i);
           auto hash = id.hash();
           auto location = 1 + (uint64_t(i) << 6) + owner;
-          auto [slot, found] = best.locate(hash, [&](uint64_t code) {
-            auto prior = code - 1;
+          auto equal = [&](Value code) {
+            const uint64_t prior = code - 1;
             return workers[prior & 63].candidates[b].key(prior >> 6) == id;
-          });
-          if (!found) {
-            best.insert(slot, hash, location);
+          };
+          Value *winner = &home[(hash / shards) & (capacity - 1)];
+          if (!*winner) {
+            *winner = Value(location);
             continue;
           }
-          auto prior = best.values[slot] - 1;
+          if (!equal(*winner)) {
+            if (!overflow) overflow.emplace(capacity);
+            const auto mixed = permute_key(hash);
+            const auto [slot, found] = overflow->locate(mixed, equal);
+            if (!found) {
+              overflow->insert(slot, mixed, location);
+              continue;
+            }
+            winner = &overflow->values[slot];
+          }
+          const uint64_t prior = *winner - 1;
           auto old_owner = unsigned(prior & 63);
           const auto r = refs[i];
           const auto old = workers[old_owner].candidates[b][prior >> 6];
@@ -384,7 +398,7 @@ void resolve_revisions(std::vector<ScanWorker<Layout>> &workers,
                             : r.ingest < old.ingest;
           if (before) {
             discard(old, old_owner);
-            best.values[slot] = location;
+            *winner = Value(location);
           } else
             discard(r, owner);
         }
