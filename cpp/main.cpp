@@ -906,6 +906,12 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
   }
   write_campaigns(output / "campaign_daily" / "part-0.parquet", campaigns);
   timer.mark("merge and Parquet output");
+#ifdef SHOP_RELEASE_PROCESS_EXIT
+  // The CLI owns all remaining arenas and mappings. Both table writers
+  // have closed successfully and all workers are joined at this point.
+  // Training and sanitizer binaries return normally to their runtimes.
+  std::_Exit(EXIT_SUCCESS);
+#endif
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revisions = 0, valid = 0, duplicates = 0, clicks_kept = 0, people = 0;
   size_t events_seen = 0, clicks_seen = 0, max_events = 0, max_clicks = 0;
