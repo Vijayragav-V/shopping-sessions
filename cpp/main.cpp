@@ -46,7 +46,7 @@ struct Click {
 };
 template <class StoredEvent> struct Candidate {
   Key id, user;
-  Time ingest;
+  const char *ingest;
   StoredEvent event;
 };
 
@@ -141,29 +141,6 @@ void route_winners(std::span<const Candidate<StoredEvent>> rows,
 
 struct Catalog {
   Dict<int> product, campaign, category;
-  // A dense suffix index handles ordinary catalog IDs. The string comparison
-  // preserves padding and case; all other spellings use the exact dictionary.
-  std::vector<int> numbered_campaigns;
-  static int suffix(Str s) {
-    if (s.size() < 3 || s.size() > 8 || s[0] != 'c' || s[1] != '_')
-      return -1;
-    int value = 0;
-    for (unsigned char c : s.substr(2)) {
-      unsigned digit = unsigned(c) - '0';
-      if (digit > 9) return -1;
-      value = value * 10 + int(digit);
-    }
-    return value;
-  }
-  int campaign_id(Str s) const {
-    unsigned n = unsigned(suffix(s));
-    if (n < numbered_campaigns.size()) {
-      int id = numbered_campaigns[n];
-      if (id && campaigns[id] == s) return id;
-    }
-    auto it = campaign.find(s);
-    return it == campaign.end() ? 0 : it->second;
-  }
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
       channels{"organic"};
   template <class F> void read(Input &input, const fs::path &file, F f) {
@@ -184,11 +161,6 @@ struct Catalog {
       campaigns.push_back(r[0]);
       channels.push_back(r[1]);
     });
-    numbered_campaigns.resize(std::min<size_t>(campaigns.size() * 2, 1000000));
-    for (size_t i = 1; i < campaigns.size(); ++i) {
-      unsigned n = unsigned(suffix(campaigns[i]));
-      if (n < numbered_campaigns.size()) numbered_campaigns[n] = int(i);
-    }
   }
 };
 struct Window {
@@ -207,14 +179,21 @@ struct Window {
       throw std::runtime_error("invalid manifest window");
   }
 };
-Event validate(const std::array<Str, 7> &r, Time ingest, const Catalog &catalog,
+Event validate(const std::array<Str, 7> &r, const Catalog &catalog,
                Window w) {
   Event drop{bad, 0, 0};
   if (r[1].empty() || r[5].empty())
     return drop;
   Time ts = timestamp(r[2]);
-  if (ts < w.start || ts >= w.end || ingest - ts > day_ms)
+  if (ts < w.start || ts >= w.end)
     return drop;
+  // F1 ingest is guaranteed. An ingest on the event's UTC date or an
+  // earlier date cannot be over 24 hours late.
+  if (!(r[2].size() == 20 && r[2][19] == 'Z' && r[2][4] == '-' &&
+        std::memcmp(r[2].data(), r[3].data(), 10) == 0)) {
+    Time day = midnight(r[3].data());
+    if (day > ts && ingest_time(r[3]) - ts > day_ms) return drop;
+  }
   if (r[4] == "view" || r[4] == "cart")
     return {ts, 0, 0};
   if (r[4] != "purchase")
@@ -521,10 +500,10 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
     rows<7>(events[job - 1], [&](auto &r) {
       if (r[0].empty())
         return;
-      Time ingest = ingest_time(r[3]);
+      const char *ingest = r[3].data();
       // Invalid revisions still take part in earliest-ingest selection.
       Key id = workers[t].pool.encode(r[0], 'e');
-      Event e = validate(r, ingest, cat, window);
+      Event e = validate(r, cat, window);
       Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
       workers[t].candidates[bucket(id)].push_back(
           {id, user, ingest, StoredEvent::encode(e, window.start)});
@@ -548,7 +527,7 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
           slot = (slot + 1) & (capacity - 1);
         if (!best[slot])
           best[slot] = &e;
-        else if (best[slot]->ingest > e.ingest) {
+        else if (std::memcmp(best[slot]->ingest, e.ingest, 19) > 0) {
           best[slot]->event.discard();
           best[slot] = &e;
         } else
@@ -566,13 +545,13 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
       if (r[0].empty() || r[1].empty())
         return;
       Time ts = timestamp(r[3]);
-      int c = cat.campaign_id(r[2]);
+      auto c = cat.campaign.find(r[2]);
       if (ts < window.start - reach || ts >= window.end ||
-          !c)
+          c == cat.campaign.end())
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c});
+                                                   Click{r[0], ts, c->second});
     });
   });
   timer.mark("click CSV and person partition");
