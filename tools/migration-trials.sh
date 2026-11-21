@@ -18,6 +18,9 @@ diff <(grep '^23 ' tools/reference-tables.txt) "$work/id"
 mapfile -t commits < <(git rev-list --reverse --first-parent "$first..HEAD" -- cpp build.sh Dockerfile)
 binaries=()
 for rev in "$base" "${commits[@]}"; do
+  # This historical intermediate failed GCC profile matching. The next
+  # production commit corrects it; it has no executable to compare.
+  if [[ ${rev:0:8} == 289d25ec ]]; then continue; fi
   name=${rev:0:8}
   dir="$work/$name"
   mkdir "$dir"

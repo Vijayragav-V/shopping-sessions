@@ -9,10 +9,10 @@ elif [ "${PGO:-0}" = 1 ]; then
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
   idx="$work/counters"
-  "$compiler" "$@" "-fprofile-generate=$idx" -fprofile-update=atomic cpp/main.cpp -o build/shopping
+  "$compiler" "$@" -DSHOP_RELEASE_PROCESS_EXIT "-fprofile-generate=$idx" -fprofile-update=atomic cpp/main.cpp -o build/shopping
   "${PYTHON:-python3}" perf/train.py "$work/input"
-  NCPU=4 build/shopping "$work/input/short" "$work/output-short"
-  NCPU=4 build/shopping "$work/input/wide" "$work/output-wide"
+  SHOP_TRAINING=1 NCPU=4 build/shopping "$work/input/short" "$work/output-short"
+  SHOP_TRAINING=1 NCPU=4 build/shopping "$work/input/wide" "$work/output-wide"
   "$compiler" "$@" -DSHOP_RELEASE_PROCESS_EXIT "-fprofile-use=$idx" -fprofile-correction -Werror=missing-profile cpp/main.cpp -o build/shopping
 else
   "$compiler" "$@" cpp/main.cpp -o build/shopping

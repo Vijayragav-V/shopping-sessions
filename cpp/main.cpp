@@ -910,7 +910,7 @@ void run_layout(const fs::path &data, const fs::path &output, unsigned threads,
   // The CLI owns all remaining arenas and mappings. Both table writers
   // have closed successfully and all workers are joined at this point.
   // Training and sanitizer binaries return normally to their runtimes.
-  std::_Exit(EXIT_SUCCESS);
+  if (!std::getenv("SHOP_TRAINING")) std::_Exit(EXIT_SUCCESS);
 #endif
 #ifdef SHOPPING_DIAGNOSTICS
   size_t revisions = 0, valid = 0, duplicates = 0, clicks_kept = 0, people = 0;
