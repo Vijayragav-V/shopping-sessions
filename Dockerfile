@@ -1,12 +1,12 @@
-FROM python:3.11-slim-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir pyarrow==21.0.0
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ python3-minimal && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY cpp cpp
 COPY build.sh .
-RUN SCORER_CPU=1 sh build.sh && mkdir /runtime && cp build/shopping /runtime && cp /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.2100 /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.2100 /runtime/
+COPY perf/train.py perf/train.py
+RUN PGO=1 sh build.sh
+
 FROM debian:bookworm-slim
-COPY --from=build /runtime /app
-ENV LD_LIBRARY_PATH=/app
+COPY --from=build /src/build/shopping /app/shopping
 USER 1000:1000
 CMD ["/app/shopping"]

@@ -23,9 +23,6 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
-#if defined(__SSE4_2__) && defined(__x86_64__)
-#include <nmmintrin.h>
-#endif
 
 namespace fs = std::filesystem;
 using Str = std::string_view;
@@ -33,6 +30,30 @@ using Time = int64_t;
 constexpr Time day_ms = 86400000, reach = 7 * day_ms, bad = INT64_MIN;
 template <class V> using Dict = std::unordered_map<Str, V>;
 
+struct InputChunk {
+  Str file;
+  size_t begin, end;
+  size_t size() const { return end - begin; }
+  Str body() const {
+    size_t first = begin;
+    if (!begin || file[begin - 1] != '\n') {
+      // Skip the header or a row owned by an earlier chunk. Bound this
+      // search so that a long physical line costs linear time overall.
+      size_t lf = file.substr(begin, size()).find('\n');
+      if (lf == Str::npos)
+        return {};
+      first += lf + 1;
+    }
+    if (first == end)
+      return {};
+    size_t last = end;
+    if (end < file.size() && file[end - 1] != '\n') {
+      size_t lf = file.find('\n', end);
+      last = lf == Str::npos ? file.size() : lf + 1;
+    }
+    return file.substr(first, last - first);
+  }
+};
 struct Input {
   std::vector<Str> mappings;
   ~Input() {
@@ -59,22 +80,15 @@ struct Input {
     mappings.emplace_back(static_cast<const char *>(ptr), st.st_size);
     return mappings.back();
   }
-  std::vector<Str> parts(const fs::path &dir) {
-    std::vector<Str> chunks;
+  std::vector<InputChunk> parts(const fs::path &dir) {
+    std::vector<InputChunk> chunks;
+    constexpr size_t block = 512 * 1024;
     for (auto &file : fs::directory_iterator(dir)) {
       if (file.path().extension() != ".csv")
         continue;
       Str data = map(file.path());
-      auto nl = data.find('\n');
-      if (nl == Str::npos)
-        continue;
-      data.remove_prefix(nl + 1);
-      while (!data.empty()) {
-        auto split = data.find('\n', 512 * 1024);
-        auto n = split == Str::npos ? data.size() : split + 1;
-        chunks.push_back(data.substr(0, n));
-        data.remove_prefix(n);
-      }
+      for (size_t off = 0; off < data.size(); off += block)
+        chunks.push_back({data, off, std::min(data.size(), off + block)});
     }
     return chunks;
   }
@@ -106,20 +120,8 @@ template <size_t N, class F> void scalar_rows(Str data, F &&callback) {
   }
 }
 
-#if defined(__AVX2__)
-#include <immintrin.h>
-constexpr size_t scan_width = 32;
-inline std::pair<unsigned, unsigned> delimiters(const char *p) {
-  auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
-  auto ends = _mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(',')),
-                              _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')));
-  return {static_cast<unsigned>(_mm256_movemask_epi8(ends)),
-          static_cast<unsigned>(_mm256_movemask_epi8(
-              _mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))))};
-}
-#elif defined(__SSE2__)
+#if defined(__SSE2__)
 #include <emmintrin.h>
-constexpr size_t scan_width = 16;
 inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   auto v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
   auto ends = _mm_or_si128(_mm_cmpeq_epi8(v, _mm_set1_epi8(',')),
@@ -129,7 +131,6 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
 }
 #elif defined(__aarch64__)
 #include <arm_neon.h>
-constexpr size_t scan_width = 16;
 inline unsigned mask(uint8x16_t matches) {
   constexpr uint8_t weights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
                                    1, 2, 4, 8, 16, 32, 64, 128};
@@ -144,8 +145,22 @@ inline std::pair<unsigned, unsigned> delimiters(const char *p) {
   return {mask(ends), mask(vceqq_u8(v, vdupq_n_u8('"')))};
 }
 #endif
+#include "csv_x86.hpp"
+#include "line_csv.hpp"
+#include "line_tile.hpp"
 template <size_t N, class F> void parse_rows(Str data, F &&callback) {
-#if defined(__AVX2__) || defined(__SSE2__) || defined(__aarch64__)
+#ifdef SHOPPING_X86_CSV
+  if (N == 7 && wide_csv_supported()) {
+    tiled_lines<N, 16>(data, callback);
+    return;
+  }
+  if (wide_csv_supported()) { line_csv_rows<N>(data,callback); return; }
+  if (wide_csv_supported()) {
+    wide_csv_rows<N>(data, callback);
+    return;
+  }
+#endif
+#if defined(__SSE2__) || defined(__aarch64__)
   if (data.empty())
     return;
   std::array<Str, N> fields;
@@ -162,11 +177,11 @@ template <size_t N, class F> void parse_rows(Str data, F &&callback) {
       fields[column] = s;
     ++column;
   };
-  for (size_t off = 0; off < data.size(); off += scan_width) {
+  for (size_t off = 0; off < data.size(); off += 16) {
     const char *base = data.data() + off;
-    char tail[scan_width]{};
+    char tail[16]{};
     const char *block = base;
-    if (data.size() - off < scan_width) {
+    if (data.size() - off < 16) {
       std::memcpy(tail, base, data.size() - off);
       block = tail;
     }
@@ -244,6 +259,42 @@ inline int pair_digits(const char *p) {
   unsigned b = unsigned(static_cast<unsigned char>(p[1])) - '0';
   return (a | b) < 16 && a < 10 && b < 10 ? int(10 * a + b) : -1000;
 }
+inline uint64_t little_word(const char *p) {
+  uint64_t word;
+  std::memcpy(&word, p, sizeof(word));
+  if constexpr (std::endian::native == std::endian::big)
+    word = __builtin_bswap64(word);
+  return word;
+}
+inline bool eight_digits(uint64_t word) {
+  const uint64_t digits = word ^ 0x3030303030303030ULL;
+  // Once the high nibbles match ASCII '0', adding six sets bit 4 in
+  // precisely the bytes above nine. No carry reaches another byte.
+  return !(digits & 0xf0f0f0f0f0f0f0f0ULL) &&
+         !((digits + 0x0606060606060606ULL) & 0x1010101010101010ULL);
+}
+inline uint32_t decimal_eight(uint64_t word) {
+  uint64_t digits = word & 0x0f0f0f0f0f0f0f0fULL;
+  uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+  uint64_t quads = (pairs * 100 + (pairs >> 16)) & 0x0000ffff0000ffffULL;
+  return uint32_t(quads) * 10000 + uint32_t(quads >> 32);
+}
+template <bool validate> inline int clock_seconds(const char *clock) {
+  // XOR with "00:00:00" in little-endian byte order. For a valid clock the
+  // separators become zero, and hour, minute and second pairs start at 0,3,6.
+  uint64_t digits = little_word(clock) ^ 0x30303a30303a3030ULL;
+  if constexpr (validate) {
+    if ((digits & 0xf0f0fff0f0fff0f0ULL) ||
+        ((digits + 0x0606000606000606ULL) & 0x1010001010001010ULL))
+      return -1;
+  }
+  uint64_t pairs = digits * 10 + (digits >> 8);
+  int h = uint8_t(pairs), m = uint8_t(pairs >> 24), s = uint8_t(pairs >> 48);
+  if constexpr (validate)
+    if (h > 23 || m > 59 || s > 59)
+      return -1;
+  return (h * 60 + m) * 60 + s;
+}
 inline Time midnight(const char *p) {
   struct CachedDay {
     uint64_t prefix{};
@@ -276,14 +327,18 @@ inline Time midnight(const char *p) {
   return hit.result;
 }
 inline Time timestamp(Str s) {
+  if (s.size() == 13) {
+    auto first = little_word(s.data()), last = little_word(s.data() + 5);
+    if (!eight_digits(first) || !eight_digits(last))
+      return bad;
+    return Time(decimal_eight(first)) * 100000 +
+           decimal_eight(last & ~0xffffffULL);
+  }
   if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
     return number(s, INT64_MAX);
   auto p = s.data();
-  if (s[10] != 'T' || s[13] != ':' || s[16] != ':')
-    return bad;
-  int h = pair_digits(p + 11), minute = pair_digits(p + 14),
-      sec = pair_digits(p + 17);
-  if (unsigned(h) > 23 || unsigned(minute) > 59 || unsigned(sec) > 59)
+  int seconds = clock_seconds<true>(p + 11);
+  if (s[10] != 'T' || seconds < 0)
     return bad;
   int offset = 0;
   if (s.size() == 25) {
@@ -295,64 +350,69 @@ inline Time timestamp(Str s) {
   } else if (p[19] != 'Z')
     return bad;
   auto day = midnight(p);
-  return day == bad ? bad
-                    : day + ((h * 60 + minute - offset) * 60 + sec) * 1000LL;
+  return day == bad ? bad : day + (seconds - offset * 60) * 1000LL;
 }
 inline Time ingest_time(Str s) {
   if (s.size() != 20)
     return timestamp(s);
   // The contract guarantees F1 for ingest_ts.
-  auto pair = [&](size_t i) { return (s[i] - '0') * 10 + s[i + 1] - '0'; };
   auto day = midnight(s.data());
-  return day == bad
-             ? bad
-             : day + ((pair(11) * 60 + pair(14)) * 60 + pair(17)) * 1000LL;
+  return day == bad ? bad : day + clock_seconds<false>(s.data() + 11) * 1000LL;
 }
 // Common identifiers contain a prefix and up to eight suffix bytes. Encode
 // them losslessly inline. Other byte strings refer to stable, borrowed views.
 // Domains (event IDs, user IDs) never compare keys from different prefixes.
+// Permute the 63 inline payload bits bijectively. Shard and table lookups
+// can reuse the stored hash, while display recovers the exact original bytes.
+inline constexpr uint64_t key_mask=UINT64_MAX>>1;
+inline constexpr uint64_t key_multiplier=0x9e3779b97f4a7c15ULL;
+inline constexpr uint64_t key_inverse=[]{
+  uint64_t x=1;
+  for(unsigned i=0;i<6;++i) x*=2-key_multiplier*x;
+  return x;
+}();
+static_assert(key_multiplier*key_inverse==1);
+inline uint64_t permute_key(uint64_t n) {
+  n^=n>>27; n=(n*key_multiplier)&key_mask;
+  return n^(n>>31);
+}
+inline uint64_t recover_key(uint64_t n) {
+  n^=(n>>31)^(n>>62); n=(n*key_inverse)&key_mask;
+  return n^(n>>27)^(n>>54);
+}
+struct BorrowedKey { Str text; size_t hash; };
 struct Key {
   uintptr_t bits{};
   bool indirect() const { return bits & 1; }
-  Str view() const { return *reinterpret_cast<const Str *>(bits - 1); }
+  Str view() const { return reinterpret_cast<const BorrowedKey *>(bits-1)->text; }
   bool operator==(Key b) const {
     return bits == b.bits || (indirect() && b.indirect() && view() == b.view());
   }
   size_t hash() const {
     if (indirect())
-      return std::hash<Str>{}(view());
-#if defined(__SSE4_2__) && defined(__x86_64__)
-    auto low = uint32_t(_mm_crc32_u64(0, bits));
-    return (uint64_t(uint32_t(bits >> 1)) << 32) | low;
-#else
-    uint64_t n = bits;
-    n ^= n >> 30;
-    n *= 0xbf58476d1ce4e5b9ULL;
-    n ^= n >> 27;
-    n *= 0x94d049bb133111ebULL;
-    return n ^ (n >> 31);
-#endif
+      return reinterpret_cast<const BorrowedKey *>(bits-1)->hash;
+    return bits >> 1;
   }
   Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
     if (indirect())
       return view();
-    uint64_t n = bits >> 1;
+    uint64_t n = recover_key(bits >> 1);
     buffer[0] = prefix;
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
   bool user_less(Key other, char prefix = 'u') const {
     if (!indirect() && !other.indirect())
-      return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
+      return __builtin_bswap64(recover_key(bits >> 1)) < __builtin_bswap64(recover_key(other.bits >> 1));
     std::array<char, 9> left, right;
-    return user_text(left, prefix) < other.user_text(right, prefix);
+    return user_text(left,prefix) < other.user_text(right,prefix);
   }
 };
 struct KeyHash {
   size_t operator()(Key k) const { return k.hash(); }
 };
 struct KeyPool {
-  std::deque<Str> other;
+  std::deque<BorrowedKey> other;
   Key encode(Str s, char prefix) {
     if constexpr (sizeof(uintptr_t) == 8 &&
                   std::endian::native == std::endian::little) {
@@ -364,120 +424,63 @@ struct KeyPool {
         else
           std::memcpy(&n, s.data() + 1, s.size() - 1);
         if (!(n >> 63))
-          return {uintptr_t(n << 1)};
+          return {uintptr_t(permute_key(n) << 1)};
       }
     }
-    other.push_back(s);
-    static_assert(alignof(Str) >= 2);
+    other.push_back({s,std::hash<Str>{}(s)});
+    static_assert(alignof(Str) >= 4);
     return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
   }
 };
-struct Identities {
-  struct Slot {
-    Key key;
-    uintptr_t value{};
-  };
-  std::vector<Slot> slots = std::vector<Slot>(256);
-  std::vector<int> parent, sizes;
-  std::vector<Key> canonical;
-  KeyPool pool;
-  void reserve(size_t input_bytes) {
-    size_t hint = std::min<size_t>(input_bytes / 18, 4'000'000);
-    slots.resize(std::max<size_t>(256, std::bit_ceil(hint + hint / 2 + 1)));
-    parent.reserve(hint);
-    sizes.reserve(hint);
-    canonical.reserve(hint);
-  }
-  size_t locate(Key k, size_t hash) const {
-    auto i = hash & (slots.size() - 1);
-    while (slots[i].key.bits && !(slots[i].key == k))
-      i = (i + 1) & (slots.size() - 1);
-    return i;
-  }
-  size_t locate(Key k) const { return locate(k, k.hash()); }
-  void prefetch(size_t hash) const {
-#if defined(__GNUC__) || defined(__clang__)
-    __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
-#elif defined(_MSC_VER) && defined(__SSE2__)
-    _mm_prefetch(reinterpret_cast<const char *>(
-                     &slots[hash & (slots.size() - 1)]),
-                 _MM_HINT_T0);
-#else
-    (void)hash;
-#endif
-  }
-  int id(Str s) {
-    if (parent.size() * 3 >= slots.size() * 2) {
-      auto old = std::move(slots);
-      slots.resize(old.size() * 2);
-      for (auto slot : old)
-        if (slot.key.bits)
-          slots[locate(slot.key)] = slot;
-    }
-    auto key = pool.encode(s, 'u');
-    auto &slot = slots[locate(key)];
-    if (!slot.key.bits) {
-      slot = {key, parent.size()};
-      parent.push_back(slot.value);
-      sizes.push_back(1);
-      canonical.push_back(key);
-    }
-    return slot.value;
-  }
-  int root(int x) {
-    while (parent[x] != x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  }
-  void join(Str a, Str b) {
-    if (a.empty() || b.empty())
-      return;
-    int x = root(id(a)), y = root(id(b));
-    if (x == y)
-      return;
-    if (sizes[x] < sizes[y])
-      std::swap(x, y);
-    parent[y] = x;
-    sizes[x] += sizes[y];
-    if (canonical[y].user_less(canonical[x])) {
-      canonical[x] = canonical[y];
-    }
-  }
-  void finish() {
-    for (auto &slot : slots)
-      if (slot.key.bits)
-        slot.value = canonical[root(slot.value)].bits;
-    std::vector<int>().swap(parent);
-    std::vector<int>().swap(sizes);
-    std::vector<Key>().swap(canonical);
-  }
-  Key resolve(Key key, size_t hash) const {
-    auto slot = slots[locate(key, hash)];
-    return slot.key.bits ? Key{slot.value} : key;
-  }
-  Key resolve(Key key) const { return resolve(key, key.hash()); }
-};
-
+constexpr size_t shards = 512;
 template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {
   std::atomic<size_t> next{0};
   std::exception_ptr error;
   std::mutex lock;
   std::vector<std::jthread> workers;
+#ifdef SHOPPING_DIAGNOSTICS
+  std::vector<metrics::WorkerLoad> loads(std::min<size_t>(threads, jobs));
+#endif
   for (unsigned t = 0; t < std::min<size_t>(threads, jobs); ++t)
     workers.emplace_back([&, t] {
+#ifdef SHOPPING_DIAGNOSTICS
+      auto &load = loads[t];
+      const auto start = metrics::now(), cpu = metrics::thread_cpu();
+#endif
       try {
         for (size_t i;
-             (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs;)
+             (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs;) {
           f(i, t);
+#ifdef SHOPPING_DIAGNOSTICS
+          ++load.jobs;
+#endif
+        }
       } catch (...) {
         std::lock_guard guard(lock);
         error = std::current_exception();
         next.store(jobs);
       }
+#ifdef SHOPPING_DIAGNOSTICS
+      load.elapsed = metrics::now() - start;
+      load.cpu = metrics::thread_cpu() - cpu;
+#endif
     });
   workers.clear();
+#ifdef SHOPPING_DIAGNOSTICS
+  if (!loads.empty()) {
+    double min_s = 1e100, max_s = 0, cpu_s = 0;
+    size_t min_jobs = jobs, max_jobs = 0;
+    for (auto &l : loads) {
+      min_s = std::min(min_s, l.elapsed * 1e-9);
+      max_s = std::max(max_s, l.elapsed * 1e-9);
+      cpu_s += l.cpu * 1e-9;
+      min_jobs = std::min(min_jobs, l.jobs);
+      max_jobs = std::max(max_jobs, l.jobs);
+    }
+    std::cerr << "worker jobs " << min_jobs << ".." << max_jobs << ", active "
+              << min_s << ".." << max_s << " s, CPU " << cpu_s << " s\n";
+  }
+#endif
   if (error)
     std::rethrow_exception(error);
 }

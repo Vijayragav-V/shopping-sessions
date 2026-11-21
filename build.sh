@@ -1,18 +1,19 @@
 #!/bin/sh
 set -eu
-arrow_dir=$("${PYTHON:-python3}" -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/pyarrow")')
-case "$(uname)" in
-  Darwin) arrow=libarrow.2100.dylib; parquet=libparquet.2100.dylib ;;
-  Linux) arrow=libarrow.so.2100; parquet=libparquet.so.2100 ;;
-esac
 mkdir -p build
-set --
-output=build/shopping
+compiler="${CXX:-c++}"
+set -- -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra
 if [ "${DIAGNOSTICS:-0}" = 1 ]; then
-  set -- -DSHOPPING_DIAGNOSTICS
-  output=build/shopping-profile
+  "$compiler" "$@" -DSHOPPING_DIAGNOSTICS cpp/main.cpp -o build/shopping-profile
+elif [ "${PGO:-0}" = 1 ]; then
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  idx="$work/counters"
+  "$compiler" "$@" "-fprofile-generate=$idx" -fprofile-update=atomic cpp/main.cpp -o build/shopping
+  "${PYTHON:-python3}" perf/train.py "$work/input"
+  NCPU=4 build/shopping "$work/input/short" "$work/output-short"
+  NCPU=4 build/shopping "$work/input/wide" "$work/output-wide"
+  "$compiler" "$@" "-fprofile-use=$idx" -fprofile-correction -Werror=missing-profile cpp/main.cpp -o build/shopping
+else
+  "$compiler" "$@" cpp/main.cpp -o build/shopping
 fi
-if [ "${SCORER_CPU:-0}" = 1 ] && [ "$(uname -m)" = x86_64 ]; then
-  set -- "$@" -march=x86-64-v3
-fi
-"${CXX:-c++}" -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "$@" -isystem "$arrow_dir/include" cpp/main.cpp "$arrow_dir/$parquet" "$arrow_dir/$arrow" -Wl,-rpath,"$arrow_dir" -o "$output"
