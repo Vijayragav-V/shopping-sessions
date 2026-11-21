@@ -3,7 +3,7 @@
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
 
-struct UserDay { Str user; int32_t day; int64_t sessions, events, revenue; std::optional<Str> category; };
+struct UserDay { Key user; int32_t day; int64_t sessions, events, revenue; std::optional<Str> category; };
 struct Counts { int64_t sessions{}, purchases{}, revenue{}, assists{}; };
 struct CampaignDay { Str campaign, channel; int32_t day; Counts counts; };
 
@@ -26,7 +26,8 @@ inline void write_users(const fs::path& file, const std::vector<UserDay>& rows) 
     arrow::Date32Builder day;
     arrow::Int64Builder sessions,events,revenue;
     for (auto& r:rows) {
-        checked(user.Append(r.user)); checked(day.Append(r.day)); checked(sessions.Append(r.sessions));
+        std::array<char,9> buffer;
+        checked(user.Append(r.user.user_text(buffer))); checked(day.Append(r.day)); checked(sessions.Append(r.sessions));
         checked(events.Append(r.events)); checked(revenue.Append(r.revenue));
         checked(r.category ? category.Append(*r.category) : category.AppendNull());
     }

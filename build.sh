@@ -6,4 +6,10 @@ case "$(uname)" in
   Linux) arrow=libarrow.so.2100; parquet=libparquet.so.2100 ;;
 esac
 mkdir -p build
-"${CXX:-c++}" -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra -isystem "$arrow_dir/include" cpp/main.cpp "$arrow_dir/$parquet" "$arrow_dir/$arrow" -Wl,-rpath,"$arrow_dir" -o build/shopping
+set --
+output=build/shopping
+if [ "${DIAGNOSTICS:-0}" = 1 ]; then
+  set -- -DSHOPPING_DIAGNOSTICS
+  output=build/shopping-profile
+fi
+"${CXX:-c++}" -std=c++20 -O3 -DNDEBUG -pthread -Wall -Wextra "$@" -isystem "$arrow_dir/include" cpp/main.cpp "$arrow_dir/$parquet" "$arrow_dir/$arrow" -Wl,-rpath,"$arrow_dir" -o "$output"

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -183,14 +184,72 @@ inline Time timestamp(Str s) {
     int days=era*146097+year*365+year/4-year/100+(153*(m+(m>2?-3:9))+2)/5+d-1-719468;
     return days*day_ms+((h*60+minute-offset)*60+sec)*1000LL;
 }
+// Common identifiers contain a prefix and up to eight suffix bytes. Encode
+// them losslessly inline. Other byte strings refer to stable, borrowed views.
+// Domains (event IDs, user IDs) never compare keys from different prefixes.
+struct Key {
+    uintptr_t bits{};
+    bool indirect() const {return bits&1;}
+    Str view() const {return *reinterpret_cast<const Str*>(bits-1);}
+    bool operator==(Key b) const {
+        return bits==b.bits || (indirect() && b.indirect() && view()==b.view());
+    }
+    size_t hash() const {
+        if(indirect()) return std::hash<Str>{}(view());
+        uint64_t n=bits;
+        n ^= n>>30; n*=0xbf58476d1ce4e5b9ULL;
+        n ^= n>>27; n*=0x94d049bb133111ebULL;
+        return n^(n>>31);
+    }
+    Str user_text(std::array<char,9>& buffer) const {
+        if(indirect()) return view();
+        uint64_t n=bits>>1;
+        buffer[0]='u';
+        std::memcpy(buffer.data()+1,&n,8);
+        return {buffer.data(),size_t(1+(std::bit_width(n)+7)/8)};
+    }
+};
+struct KeyHash {size_t operator()(Key k) const {return k.hash();}};
+struct KeyPool {
+    std::deque<Str> other;
+    Key encode(Str s,char prefix) {
+        if constexpr(sizeof(uintptr_t)==8 && std::endian::native==std::endian::little) {
+            if(s.size()>=2 && s.size()<=9 && s.front()==prefix && s.back()!=0) {
+                uint64_t n=0;
+                if(s.size()==9) std::memcpy(&n,s.data()+1,8);
+                else std::memcpy(&n,s.data()+1,s.size()-1);
+                if(!(n>>63)) return {uintptr_t(n<<1)};
+            }
+        }
+        other.push_back(s);
+        static_assert(alignof(Str)>=2);
+        return {reinterpret_cast<uintptr_t>(&other.back())|1};
+    }
+};
 struct Identities {
-    Dict<int> ids;
+    struct Slot {Key key; uintptr_t value{};};
+    std::vector<Slot> slots=std::vector<Slot>(256);
     std::vector<int> parent, sizes;
     std::vector<Str> names;
+    std::vector<Key> canonical;
+    KeyPool pool;
+    size_t locate(Key k) const {
+        auto i=k.hash()&(slots.size()-1);
+        while(slots[i].key.bits && !(slots[i].key==k)) i=(i+1)&(slots.size()-1);
+        return i;
+    }
     int id(Str s) {
-        auto [it,new_id]=ids.try_emplace(s,parent.size());
-        if (new_id) { parent.push_back(it->second); sizes.push_back(1); names.push_back(s); }
-        return it->second;
+        if(parent.size()*3>=slots.size()*2) {
+            auto old=std::move(slots); slots.resize(old.size()*2);
+            for(auto slot:old) if(slot.key.bits) slots[locate(slot.key)]=slot;
+        }
+        auto key=pool.encode(s,'u');
+        auto& slot=slots[locate(key)];
+        if(!slot.key.bits) {
+            slot={key,parent.size()}; parent.push_back(slot.value);
+            sizes.push_back(1); names.push_back(s); canonical.push_back(key);
+        }
+        return slot.value;
     }
     int root(int x) {
         while (parent[x]!=x) { parent[x]=parent[parent[x]]; x=parent[x]; }
@@ -201,12 +260,17 @@ struct Identities {
         int x=root(id(a)), y=root(id(b));
         if (x==y) return;
         if (sizes[x]<sizes[y]) std::swap(x,y);
-        parent[y]=x; sizes[x]+=sizes[y]; names[x]=std::min(names[x],names[y]);
+        parent[y]=x; sizes[x]+=sizes[y];
+        if(names[y]<names[x]) {names[x]=names[y]; canonical[x]=canonical[y];}
     }
-    void finish() { for (auto& [_,v]:ids) v=root(v); }
-    Str resolve(Str s) const {
-        auto it=ids.find(s);
-        return it==ids.end() ? s : names[it->second];
+    void finish() {
+        for(auto& slot:slots) if(slot.key.bits) slot.value=canonical[root(slot.value)].bits;
+        std::vector<int>().swap(parent); std::vector<int>().swap(sizes);
+        std::vector<Str>().swap(names); std::vector<Key>().swap(canonical);
+    }
+    Key resolve(Key key) const {
+        auto slot=slots[locate(key)];
+        return slot.key.bits ? Key{slot.value} : key;
     }
 };
 

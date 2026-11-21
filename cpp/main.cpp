@@ -1,18 +1,20 @@
 #include "input.hpp"
+#include "metrics.hpp"
 #include "output.hpp"
 #include <map>
 #include <regex>
 
 constexpr size_t shards=128;
-size_t bucket(Str s) { return std::hash<Str>{}(s)%shards; }
+size_t bucket(Key k) { return k.hash()%shards; }
 struct Event { Time ts; int32_t price, category; };
 struct Click { Str id; Time ts; int32_t campaign; };
-struct Candidate { Str id,user; Time ingest; Event event; size_t hash; };
+struct Candidate { Key id,user; Time ingest; Event event; };
 template<class T> using Bins=std::array<std::vector<T>,shards>;
 struct Worker {
     Bins<Candidate> candidates;
-    Bins<std::pair<Str,Event>> events;
-    Bins<std::pair<Str,Click>> clicks;
+    Bins<std::pair<Key,Event>> events;
+    Bins<std::pair<Key,Click>> clicks;
+    KeyPool pool;
 };
 struct Catalog {
     Dict<int> product,campaign,category;
@@ -60,21 +62,51 @@ Event validate(const std::array<Str,7>& r, Time ingest, const Catalog& catalog, 
 }
 struct Person { std::vector<Event> events; std::vector<Click> clicks; };
 using Totals=std::map<std::pair<int,int32_t>,Counts>;
-struct Result { std::vector<UserDay> users; Totals campaigns; };
+int32_t utc_day(Time ts) { return int32_t(ts/day_ms-(ts%day_ms<0)); }
+struct Result {
+    std::vector<UserDay> users;
+    Totals sparse;
+    std::vector<Counts> table;
+    int32_t first_day{};
+    size_t campaigns{};
+    void configure(Window w,size_t count,unsigned threads) {
+        first_day=utc_day(w.start); campaigns=count;
+        size_t days=size_t(utc_day(w.end-1)-first_day)+1;
+        if(days<=4'000'000/threads/count) table.resize(days*count);
+    }
+    Counts& at(int campaign,int32_t day) {
+        if(table.empty()) return sparse[{campaign,day}];
+        return table[size_t(day-first_day)*campaigns+campaign];
+    }
+    void merge_into(Totals& merged) const {
+        auto add=[&](int campaign,int32_t day,const Counts& c){
+            auto& dest=merged[{campaign,day}];
+            dest.sessions+=c.sessions; dest.purchases+=c.purchases;
+            dest.revenue+=c.revenue; dest.assists+=c.assists;
+        };
+        for(auto& [k,c]:sparse) add(k.first,k.second,c);
+        for(size_t i=0;i<table.size();++i) if(table[i].sessions || table[i].assists)
+            add(i%campaigns,first_day+int32_t(i/campaigns),table[i]);
+    }
+};
 
-void summarize(Str user, Person& person,const Catalog& cat,Result& result) {
+void summarize(Key user, Person& person,const Catalog& cat,Result& result) {
     auto& events=person.events; auto& clicks=person.clicks;
     if(events.empty()) return;
+    {
+    MEASURE(sorting);
     std::sort(events.begin(),events.end(),[](auto a,auto b){return a.ts<b.ts;});
     std::sort(clicks.begin(),clicks.end(),[](const auto& a,const auto& b){
         return a.ts==b.ts ? a.id>b.id : a.ts<b.ts;
     });
+    }
     // Exact click copies have no effect on the winner or distinct active campaigns.
     size_t left=0,right=0;
     std::unordered_map<int,size_t> active;
     std::unordered_map<int,int64_t> spend;
     UserDay daily{user,0,0,0,0,{}};
     auto finish_day=[&] {
+        MEASURE(aggregation);
         int64_t best=0;
         for(auto [k,v]:spend) {
             if(v>best || (v==best && cat.categories[k]<*daily.category)) {
@@ -85,25 +117,32 @@ void summarize(Str user, Person& person,const Catalog& cat,Result& result) {
     };
     for(size_t i=0;i<events.size();) {
         auto start=events[i].ts;
-        auto day=int32_t(start/day_ms-(start%day_ms<0));
+        auto day=utc_day(start);
         if(daily.sessions && day!=daily.day) { finish_day(); daily={user,day,0,0,0,{}}; }
         daily.day=day;
         size_t first=i;
         int64_t revenue=0;
+        {
+        MEASURE(session);
         do {
             auto e=events[i++];
             if(e.price) { spend[e.category]+=e.price; revenue+=e.price; }
         } while(i<events.size() && events[i].ts-events[i-1].ts<=1800000);
+        }
         ++daily.sessions; daily.events+=i-first; daily.revenue+=revenue;
+        {
+        MEASURE(attribution);
         while(right<clicks.size() && clicks[right].ts<=start) ++active[clicks[right++].campaign];
         while(left<right && clicks[left].ts<start-reach) {
             auto it=active.find(clicks[left++].campaign);
             if(--it->second==0) active.erase(it);
         }
+        }
+        MEASURE(aggregation);
         int winner=left<right ? clicks[right-1].campaign : 0;
-        auto& counts=result.campaigns[{winner,day}];
+        auto& counts=result.at(winner,day);
         ++counts.sessions; counts.purchases+=revenue!=0; counts.revenue+=revenue;
-        for(auto [campaign,_]:active) ++result.campaigns[{campaign,day}].assists;
+        for(auto [campaign,_]:active) ++result.at(campaign,day).assists;
     }
     finish_day();
 }
@@ -132,9 +171,10 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
             if(r[0].empty()) return;
             Time ingest=timestamp(r[3]);
             // Invalid revisions still take part in earliest-ingest selection.
-            size_t hash=std::hash<Str>{}(r[0]);
+            Key id=workers[t].pool.encode(r[0],'e');
             Event e=validate(r,ingest,cat,window);
-            workers[t].candidates[hash%shards].push_back({r[0],r[1],ingest,e,hash});
+            Key user=e.ts==bad ? Key{} : workers[t].pool.encode(r[1],'u');
+            workers[t].candidates[bucket(id)].push_back({id,user,ingest,e});
         });
     });
     timer.mark("event CSV, validation and partition");
@@ -147,8 +187,8 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
         while(capacity<count+count/2) capacity*=2;
         std::vector<Candidate*> best(capacity,nullptr);
         for(auto& w:workers) for(auto& e:w.candidates[b]) {
-            size_t slot=(e.hash/shards)&(capacity-1);
-            while(best[slot] && (best[slot]->hash!=e.hash || best[slot]->id!=e.id))
+            size_t slot=(e.id.hash()/shards)&(capacity-1);
+            while(best[slot] && !(best[slot]->id==e.id))
                 slot=(slot+1)&(capacity-1);
             if(!best[slot]) best[slot]=&e;
             else if(best[slot]->ingest>e.ingest) {
@@ -168,14 +208,17 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
             if(r[0].empty() || r[1].empty()) return;
             Time ts=timestamp(r[3]); auto c=cat.campaign.find(r[2]);
             if(ts<window.start-reach || ts>=window.end || c==cat.campaign.end()) return;
-            Str user=ids.resolve(r[1]);
+            Key user=ids.resolve(workers[t].pool.encode(r[1],'u'));
             workers[t].clicks[bucket(user)].emplace_back(user,Click{r[0],ts,c->second});
         });
     });
     timer.mark("click CSV and person partition");
     std::vector<Result> results(threads);
+    for(auto& result:results) result.configure(window,cat.campaigns.size(),threads);
     parallel(shards,threads,[&](size_t b,unsigned t){
-        Dict<Person> people;
+        std::unordered_map<Key,Person,KeyHash> people;
+        {
+        MEASURE(grouping);
         for(auto& w:workers) {
             for(auto& [u,e]:w.events[b]) people[u].events.push_back(e);
             decltype(w.events)::value_type().swap(w.events[b]);
@@ -187,6 +230,7 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
             }
             decltype(w.clicks)::value_type().swap(w.clicks[b]);
         }
+        }
         for(auto& [u,p]:people) summarize(u,p,cat,results[t]);
     });
     timer.mark("person grouping, sorting, sessions, attribution and aggregation");
@@ -196,14 +240,14 @@ void run(const fs::path& data,const fs::path& output,unsigned threads) {
         write_users(output/"user_daily"/("part-"+std::to_string(i)+".parquet"),results[i].users);
     });
     Totals merged;
-    for(auto& r:results) for(auto& [key,c]:r.campaigns) {
-        auto& dest=merged[key];
-        dest.sessions+=c.sessions; dest.purchases+=c.purchases; dest.revenue+=c.revenue; dest.assists+=c.assists;
-    }
+    for(auto& r:results) r.merge_into(merged);
     std::vector<CampaignDay> campaigns;
     for(auto& [key,c]:merged) campaigns.push_back({cat.campaigns[key.first],cat.channels[key.first],key.second,c});
     write_campaigns(output/"campaign_daily"/"part-0.parquet",campaigns);
     timer.mark("merge and Parquet output");
+#ifdef SHOPPING_DIAGNOSTICS
+    metrics::report();
+#endif
 }
 int main(int argc,char** argv) {
     auto env=[](const char* key,const char* fallback){ auto s=std::getenv(key); return s?s:fallback; };
