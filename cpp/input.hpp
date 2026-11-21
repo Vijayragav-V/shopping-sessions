@@ -357,34 +357,48 @@ inline Time ingest_time(Str s) {
 // Common identifiers contain a prefix and up to eight suffix bytes. Encode
 // them losslessly inline. Other byte strings refer to stable, borrowed views.
 // Domains (event IDs, user IDs) never compare keys from different prefixes.
+// Permute the 63 inline payload bits bijectively. Shard and table lookups
+// can reuse the stored hash, while display recovers the exact original bytes.
+inline constexpr uint64_t key_mask=UINT64_MAX>>1;
+inline constexpr uint64_t key_multiplier=0x9e3779b97f4a7c15ULL;
+inline constexpr uint64_t key_inverse=[]{
+  uint64_t x=1;
+  for(unsigned i=0;i<6;++i) x*=2-key_multiplier*x;
+  return x;
+}();
+static_assert(key_multiplier*key_inverse==1);
+inline uint64_t permute_key(uint64_t n) {
+  n^=n>>27; n=(n*key_multiplier)&key_mask;
+  return n^(n>>31);
+}
+inline uint64_t recover_key(uint64_t n) {
+  n^=(n>>31)^(n>>62); n=(n*key_inverse)&key_mask;
+  return n^(n>>27)^(n>>54);
+}
+struct BorrowedKey { Str text; size_t hash; };
 struct Key {
   uintptr_t bits{};
   bool indirect() const { return bits & 1; }
-  Str view() const { return *reinterpret_cast<const Str *>(bits - 1); }
+  Str view() const { return reinterpret_cast<const BorrowedKey *>(bits-1)->text; }
   bool operator==(Key b) const {
     return bits == b.bits || (indirect() && b.indirect() && view() == b.view());
   }
   size_t hash() const {
     if (indirect())
-      return std::hash<Str>{}(view());
-    uint64_t n = bits;
-    n ^= n >> 30;
-    n *= 0xbf58476d1ce4e5b9ULL;
-    n ^= n >> 27;
-    n *= 0x94d049bb133111ebULL;
-    return n ^ (n >> 31);
+      return reinterpret_cast<const BorrowedKey *>(bits-1)->hash;
+    return bits >> 1;
   }
   Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
     if (indirect())
       return view();
-    uint64_t n = bits >> 1;
+    uint64_t n = recover_key(bits >> 1);
     buffer[0] = prefix;
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
   bool user_less(Key other, char prefix = 'u') const {
     if (!indirect() && !other.indirect())
-      return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
+      return __builtin_bswap64(recover_key(bits >> 1)) < __builtin_bswap64(recover_key(other.bits >> 1));
     std::array<char, 9> left, right;
     return user_text(left,prefix) < other.user_text(right,prefix);
   }
@@ -393,7 +407,7 @@ struct KeyHash {
   size_t operator()(Key k) const { return k.hash(); }
 };
 struct KeyPool {
-  std::deque<Str> other;
+  std::deque<BorrowedKey> other;
   Key encode(Str s, char prefix) {
     if constexpr (sizeof(uintptr_t) == 8 &&
                   std::endian::native == std::endian::little) {
@@ -405,10 +419,10 @@ struct KeyPool {
         else
           std::memcpy(&n, s.data() + 1, s.size() - 1);
         if (!(n >> 63))
-          return {uintptr_t(n << 1)};
+          return {uintptr_t(permute_key(n) << 1)};
       }
     }
-    other.push_back(s);
+    other.push_back({s,std::hash<Str>{}(s)});
     static_assert(alignof(Str) >= 4);
     return {reinterpret_cast<uintptr_t>(&other.back()) | 1};
   }

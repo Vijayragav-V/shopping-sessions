@@ -8,8 +8,30 @@
 | `1bcbf0cd1a2754fb8812fd91e2ef5f4237dc928e` | **1.82 s** | Only `.gitignore` changed |
 | `8b2f568600d0fb5cc9bc066dc13ce609ed5d0e7b` | **1.83 s** | First 512-shard release |
 | `6129109af768205fc66e05bd2d89711fa5d03b46` | **1.68 s** | SIMD CSV decoding, dense linked-person routing and delta Parquet |
+| `8430241e49a4147b9b42dffce4cf21a4088eb5ff` | **1.13 s** | Concurrent input, compact revision and timeline storage, fused alias graph, partition slabs and direct Parquet |
 
-The entrant supplied all four scores. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
+The entrant supplied these scores. The scorer marked `BB-BE7C95B8` as entered in the final with 3 ms queue wait. Its 1.13 s runtime was 32.7% lower than the previous 1.68 s best. Entries `BB-065C223B` and `BB-E8D93ABE` listed 41 ms and 105 ms of queue wait separately. Relative to `61e9ba6`, the 512-shard release decodes each field as its delimiter is encountered, raises the event and person shard count from 128 to 512, reserves identity storage from input size, and compares inline canonical IDs bytewise without a separate display-name vector. It also reserves Arrow builder capacity and uses unchecked numeric appends within that reservation. Its compiler flags, Dockerfile, global deduplication rules, session boundaries and attribution algorithm match the official baseline. Its official run was 0.03 s slower. Two submissions of the identical baseline pipeline differed by 0.02 s.
+
+## Reversible IDs and profile-guided compilation
+
+The Intel runner measured the exact source of the 1.13 s release against a lossless ID representation and a GCC profile-guided build. The ID permutation computes the hash at ingestion. Repeated shard and table lookups reuse it. Recovering the original bytes preserves lexicographic ordering for linked names and click ties. Indirect strings retain their full bytes and cache their hash. Two small synthetic build-time workloads exercise short and wide windows, ordinary and arbitrary IDs, and conflicting revisions. The container includes only the resulting executable and the Debian runtime.
+
+| Four pinned vCPUs on Intel Xeon 6975P-C | 20M warm median | 60M warm median | Peak RSS at 60M |
+| --- | ---: | ---: | ---: |
+| Official 1.68 s release | 2.1143 s | 7.0492 s | 9,334 MiB |
+| Official 1.13 s release | 1.3270 s | 4.1328 s | 8,287 MiB |
+| Reversible IDs | 1.2927 s | — | — |
+| Reversible IDs and build-time profiling | **1.2198 s** | **3.6877 s** | **8,285 MiB** |
+| Same build with session-index interval attribution from 32 clicks | 1.2233 s | 3.7378 s | 8,284 MiB |
+| Same interval build with chunk prefetch / sequential mapping advice | 1.2239 / 1.2224 s | 3.7511 / 3.7361 s | 8,284 / 8,283 MiB |
+
+The candidate finished ahead of the 1.13 s source in every one of five rotated practice rounds and all three final-scale rounds. Its medians fell 8.1% at 20M and 10.8% at 60M. At 20M the individual times were 1.2024, 1.2053, 1.2198, 1.2246 and 1.2201 s. Tests with forced eviction confirmed 0% input residency at startup. The candidate took 3.782–3.801 s at 20M and 12.928–12.979 s at 60M. Chunk prefetch and Linux sequential advice failed to improve the 60M cold median. Separate trials with vectors found profile-guided compilation faster than link-time optimization on both Intel and AMD. [Paired Intel timings](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874938746/job/136757467569) · [Compiler and attribution comparisons](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874463331)
+
+The 20M Intel phase medians were 0.627 s for concurrent input, validation and partitioning, 0.090 s for deduplication, 0.202 s for raw-user grouping and singleton processing, 0.026 s for the identity union, 0.187 s for linked sessions and attribution, and 0.045 s for merge and Parquet. At 60M those figures were 1.841, 0.354, 0.665, 0.089, 0.535 and 0.108 s. The 60M/20M full-process ratio was 3.02. A separate design that grouped aliases while scanning and stored records in per-alias blocks eliminated the later counting and scatter pass. In five warm arm64 rounds its two block sizes took 1.456 and 1.444 s, versus 0.499 s for the official 1.13 s source. The changes increased CPU time and peak memory. Its fixtures, published references and both 20M tables matched.
+
+On the same native Intel runner, the actual linux/amd64 release image ran five 20M processes in 1.251, 1.250, 1.252, 1.279 and 1.262 s. Its 60M times were 3.820, 3.717 and 3.838 s. Peak process RSS was 2,811 MiB at 20M and 8,282 MiB at 60M. Including the `docker run` command increased the medians to 1.357 and 3.931 s. The old 1.68 s release image measured 2.156 and 7.130 s inside its container. The release binary in this Intel run had SHA-256 `76de9abe1b09be6f3a303eff41b78905629c544106d5260fec8393dd74da5617`. [Native Docker measurements](https://github.com/mwkhettab/shopping-sessions-cpp/actions/runs/44874938746/job/136757467569)
+
+The local linux/amd64 image passed the 36 fixtures, extended regressions, both published 1M reference tables and full comparisons at 20M and 60M. Both tables had unique keys. The counts were 2,226,509 and 28,014 rows at 20M, then 6,684,549 and 28,014 at 60M. With Mac-host-mounted input, translated amd64 execution and a 7 GiB cgroup, the process took 4.788 and 43.560 s. The latter reached 7,140 MiB process RSS and the 7,168 MiB cgroup limit. The local executable had SHA-256 `1a1468538c686c3e099061e1da76865d12efd7f9bbc7a1be5cc87c40625a6a11`. Each Docker build collects a new multithreaded compiler profile.
 
 ## November 21 compact-partition release
 

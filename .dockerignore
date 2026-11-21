@@ -2,3 +2,6 @@
 !cpp/
 !cpp/**
 !build.sh
+
+!perf/
+!perf/train.py

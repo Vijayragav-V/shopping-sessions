@@ -6,7 +6,7 @@ The complete challenge contract is in [`rules.md`](rules.md).
 
 ## Build the submission image
 
-The scorer runs `linux/amd64`. Build the same image locally with Docker Buildx:
+The scorer runs `linux/amd64`. Build the same image locally with Docker Buildx. The build trains GCC on two small synthetic workloads, then copies the optimized executable into the runtime image.
 
 ```sh
 docker buildx build --platform linux/amd64 --load \
@@ -54,5 +54,7 @@ DATA_DIR=dev OUTPUT_DIR=output NCPU=8 ./build/shopping
 Workers parse events, clicks and identity links into partitions. Every CSV-valid event revision with an ID enters the global earliest-ingest comparison, including revisions that fail semantic validation. A losing revision invalidates its own raw event slot. Link endpoints and surviving records share the same exact byte-key groups. A parallel union finds the smallest alias in each connected component, including link-only aliases.
 
 Short person timelines use a chronological sort. For dense timelines, half-hour bins keep their first and last milliseconds, event counts and purchases. The gap between adjacent occupied bins decides whether their events belong to the same session. Wide manifest windows and large catalogs retain full time and category widths. The writer emits the two flat Parquet tables directly.
+
+Short IDs use a reversible 63-bit representation. Its bits select the same shard and hash-table slot on each lookup. Comparisons for a canonical person name or tied click recover the original bytes. Other IDs retain their complete input string and a cached hash.
 
 The native comparisons, resource limits and correctness checks are recorded in [BENCHMARKS.md](BENCHMARKS.md).
