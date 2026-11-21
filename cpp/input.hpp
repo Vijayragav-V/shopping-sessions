@@ -318,17 +318,12 @@ struct Key {
   size_t hash() const {
     if (indirect())
       return std::hash<Str>{}(view());
-#if defined(__SSE4_2__) && defined(__x86_64__)
-    auto low = uint32_t(_mm_crc32_u64(0, bits));
-    return (uint64_t(uint32_t(bits >> 1)) << 32) | low;
-#else
     uint64_t n = bits;
     n ^= n >> 30;
     n *= 0xbf58476d1ce4e5b9ULL;
     n ^= n >> 27;
     n *= 0x94d049bb133111ebULL;
     return n ^ (n >> 31);
-#endif
   }
   Str user_text(std::array<char, 9> &buffer) const {
     if (indirect())

@@ -6,7 +6,7 @@
 #include <span>
 #include <type_traits>
 
-constexpr size_t shards = 128;
+constexpr size_t shards = 512;
 constexpr uint32_t session_gap = 1'800'000;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
@@ -141,6 +141,29 @@ void route_winners(std::span<const Candidate<StoredEvent>> rows,
 
 struct Catalog {
   Dict<int> product, campaign, category;
+  // A dense suffix index handles ordinary catalog IDs. The string comparison
+  // preserves padding and case; all other spellings use the exact dictionary.
+  std::vector<int> numbered_campaigns;
+  static int suffix(Str s) {
+    if (s.size() < 3 || s.size() > 8 || s[0] != 'c' || s[1] != '_')
+      return -1;
+    int value = 0;
+    for (unsigned char c : s.substr(2)) {
+      unsigned digit = unsigned(c) - '0';
+      if (digit > 9) return -1;
+      value = value * 10 + int(digit);
+    }
+    return value;
+  }
+  int campaign_id(Str s) const {
+    unsigned n = unsigned(suffix(s));
+    if (n < numbered_campaigns.size()) {
+      int id = numbered_campaigns[n];
+      if (id && campaigns[id] == s) return id;
+    }
+    auto it = campaign.find(s);
+    return it == campaign.end() ? 0 : it->second;
+  }
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
       channels{"organic"};
   template <class F> void read(Input &input, const fs::path &file, F f) {
@@ -161,6 +184,11 @@ struct Catalog {
       campaigns.push_back(r[0]);
       channels.push_back(r[1]);
     });
+    numbered_campaigns.resize(std::min<size_t>(campaigns.size() * 2, 1000000));
+    for (size_t i = 1; i < campaigns.size(); ++i) {
+      unsigned n = unsigned(suffix(campaigns[i]));
+      if (n < numbered_campaigns.size()) numbered_campaigns[n] = int(i);
+    }
   }
 };
 struct Window {
@@ -538,13 +566,13 @@ void process(const fs::path &data, const fs::path &output, unsigned threads,
       if (r[0].empty() || r[1].empty())
         return;
       Time ts = timestamp(r[3]);
-      auto c = cat.campaign.find(r[2]);
+      int c = cat.campaign_id(r[2]);
       if (ts < window.start - reach || ts >= window.end ||
-          c == cat.campaign.end())
+          !c)
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c->second});
+                                                   Click{r[0], ts, c});
     });
   });
   timer.mark("click CSV and person partition");
