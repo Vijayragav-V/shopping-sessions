@@ -1,0 +1,36 @@
+name: Record independent reference fingerprints
+on:
+  push:
+    branches: [verify/record-gate-references]
+permissions:
+  contents: read
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        seed: [23, 47, 733]
+    env:
+      SEED: ${{ matrix.seed }}
+      POLARS_MAX_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, persist-credentials: false}
+      - run: |
+          export GATE_ASSETS="$RUNNER_TEMP/assets"
+          python3 -m venv "$RUNNER_TEMP/py"
+          source "$RUNNER_TEMP/py/bin/activate"
+          pip -q install polars==2.1.0
+          bash tools/prepare-gate.sh
+          size=60000000; if [[ "$SEED" == 23 ]]; then size=20000000; fi
+          "$GATE_ASSETS/generate" --seed "$SEED" --events "$size" --clicks "$((size / 4))" --threads 2 --output "$RUNNER_TEMP/input"
+          NCPU=4 "$GATE_ASSETS/oracle/build/shopping" "$RUNNER_TEMP/input" "$RUNNER_TEMP/reference"
+          export PYTHONPATH="$GATE_ASSETS/starter-pyspark/scripts"
+          python tools/reference_id.py "$SEED" "$RUNNER_TEMP/reference" | tee "$RUNNER_TEMP/id"
+          while IFS= read -r line; do echo "::notice title=Reference::$line"; done < "$RUNNER_TEMP/id"
+          tar czf "$RUNNER_TEMP/reference.tgz" -C "$RUNNER_TEMP/reference" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-${{ matrix.seed }}
+          path: ${{ runner.temp }}/reference.tgz
+          retention-days: 90
