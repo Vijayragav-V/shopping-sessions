@@ -23,6 +23,9 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#if defined(__SSE4_2__) && defined(__x86_64__)
+#include <nmmintrin.h>
+#endif
 
 namespace fs = std::filesystem;
 using Str = std::string_view;
@@ -318,26 +321,31 @@ struct Key {
   size_t hash() const {
     if (indirect())
       return std::hash<Str>{}(view());
+#if defined(__SSE4_2__) && defined(__x86_64__)
+    auto low = uint32_t(_mm_crc32_u64(0, bits));
+    return (uint64_t(uint32_t(bits >> 1)) << 32) | low;
+#else
     uint64_t n = bits;
     n ^= n >> 30;
     n *= 0xbf58476d1ce4e5b9ULL;
     n ^= n >> 27;
     n *= 0x94d049bb133111ebULL;
     return n ^ (n >> 31);
+#endif
   }
-  Str user_text(std::array<char, 9> &buffer) const {
+  Str user_text(std::array<char, 9> &buffer, char prefix = 'u') const {
     if (indirect())
       return view();
     uint64_t n = bits >> 1;
-    buffer[0] = 'u';
+    buffer[0] = prefix;
     std::memcpy(buffer.data() + 1, &n, 8);
     return {buffer.data(), size_t(1 + (std::bit_width(n) + 7) / 8)};
   }
-  bool user_less(Key other) const {
+  bool user_less(Key other, char prefix = 'u') const {
     if (!indirect() && !other.indirect())
       return __builtin_bswap64(bits >> 1) < __builtin_bswap64(other.bits >> 1);
     std::array<char, 9> left, right;
-    return user_text(left) < other.user_text(right);
+    return user_text(left, prefix) < other.user_text(right, prefix);
   }
 };
 struct KeyHash {
@@ -380,11 +388,23 @@ struct Identities {
     sizes.reserve(hint);
     canonical.reserve(hint);
   }
-  size_t locate(Key k) const {
-    auto i = k.hash() & (slots.size() - 1);
+  size_t locate(Key k, size_t hash) const {
+    auto i = hash & (slots.size() - 1);
     while (slots[i].key.bits && !(slots[i].key == k))
       i = (i + 1) & (slots.size() - 1);
     return i;
+  }
+  size_t locate(Key k) const { return locate(k, k.hash()); }
+  void prefetch(size_t hash) const {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(&slots[hash & (slots.size() - 1)], 0, 3);
+#elif defined(_MSC_VER) && defined(__SSE2__)
+    _mm_prefetch(reinterpret_cast<const char *>(
+                     &slots[hash & (slots.size() - 1)]),
+                 _MM_HINT_T0);
+#else
+    (void)hash;
+#endif
   }
   int id(Str s) {
     if (parent.size() * 3 >= slots.size() * 2) {
@@ -433,10 +453,11 @@ struct Identities {
     std::vector<int>().swap(sizes);
     std::vector<Key>().swap(canonical);
   }
-  Key resolve(Key key) const {
-    auto slot = slots[locate(key)];
+  Key resolve(Key key, size_t hash) const {
+    auto slot = slots[locate(key, hash)];
     return slot.key.bits ? Key{slot.value} : key;
   }
+  Key resolve(Key key) const { return resolve(key, key.hash()); }
 };
 
 template <class F> void parallel(size_t jobs, unsigned threads, F &&f) {

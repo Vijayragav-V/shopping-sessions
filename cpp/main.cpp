@@ -4,22 +4,71 @@
 #include <map>
 #include <regex>
 #include <span>
+#include <type_traits>
 
 constexpr size_t shards = 512;
+constexpr uint32_t session_gap = 1'800'000;
 size_t bucket(Key k) { return k.hash() % shards; }
 struct Event {
   Time ts;
   int32_t price, category;
+
+  static Event encode(Event e, Time) { return e; }
+  Event decode(Time) const { return *this; }
+  bool valid() const { return ts != bad; }
+  void discard() { ts = bad; }
+  bool operator<(const Event &other) const { return ts < other.ts; }
+};
+
+// In a short window, timestamps fit in the high word. Sorting the whole key
+// also orders equal-time events by purchase details, which share a session.
+struct CompactEvent {
+  uint64_t bits;
+  static CompactEvent encode(Event e, Time start) {
+    if (!e.valid())
+      return {UINT64_MAX};
+    return {(uint64_t(e.ts - start) << 32) | (uint64_t(e.category) << 24) |
+            uint32_t(e.price)};
+  }
+  Event decode(Time start) const {
+    return {start + offset(), int32_t(bits & 0xffffff),
+            int32_t((bits >> 24) & 0xff)};
+  }
+  uint32_t offset() const { return uint32_t(bits >> 32); }
+  bool valid() const { return bits != UINT64_MAX; }
+  void discard() { bits = UINT64_MAX; }
+  bool operator<(const CompactEvent &other) const { return bits < other.bits; }
 };
 struct Click {
   Str id;
   Time ts;
   int32_t campaign;
+  static Click make(KeyPool &, Str id, Time ts, int campaign, Time) {
+    return {id, ts, campaign};
+  }
+  Time time(Time) const { return ts; }
+  bool operator<(const Click &b) const {
+    return ts == b.ts ? id > b.id : ts < b.ts;
+  }
 };
-struct Candidate {
+struct CompactClick {
+  Key id;
+  uint32_t offset;
+  int32_t campaign;
+  static CompactClick make(KeyPool &pool, Str id, Time ts, int campaign, Time start) {
+    return {pool.encode(id, 'k'), uint32_t(ts - (start - reach)), campaign};
+  }
+  Time time(Time start) const { return start - reach + offset; }
+  bool operator<(const CompactClick &b) const {
+    return offset == b.offset ? b.id.user_less(id, 'k') : offset < b.offset;
+  }
+};
+template<class StoredEvent>
+using ClickFor = std::conditional_t<std::is_same_v<StoredEvent,CompactEvent>, CompactClick, Click>;
+template <class StoredEvent> struct Candidate {
   Key id, user;
   Time ingest;
-  Event event;
+  StoredEvent event;
 };
 
 struct Group {
@@ -74,14 +123,68 @@ public:
 };
 
 template <class T> using Bins = std::array<std::vector<T>, shards>;
-struct Worker {
-  Bins<Candidate> candidates;
-  Bins<std::pair<Key, Event>> events;
-  Bins<std::pair<Key, Click>> clicks;
+template <class StoredEvent> struct Worker {
+  Bins<Candidate<StoredEvent>> candidates;
+  Bins<std::pair<Key, StoredEvent>> events;
+  Bins<std::pair<Key, ClickFor<StoredEvent>>> clicks;
   KeyPool pool;
 };
+
+template <class StoredEvent>
+void route_winners(std::span<const Candidate<StoredEvent>> rows,
+                   const Identities &ids,
+                   Bins<std::pair<Key, StoredEvent>> &destination) {
+  struct Probe {
+    const Candidate<StoredEvent> *row;
+    size_t hash;
+  };
+  std::array<Probe, 32> probes;
+  while (!rows.empty()) {
+    auto batch = rows.first(std::min(rows.size(), probes.size()));
+    rows = rows.subspan(batch.size());
+    size_t count = 0;
+    // Start independent alias-table loads before following any probe chains.
+    for (const auto &row : batch) {
+      if (!row.event.valid())
+        continue;
+      auto hash = row.user.hash();
+      ids.prefetch(hash);
+      probes[count++] = {&row, hash};
+    }
+    for (size_t i = 0; i < count; ++i) {
+      const auto &[row, hash] = probes[i];
+      Key person = ids.resolve(row->user, hash);
+      size_t shard = person.bits == row->user.bits ? hash % shards : bucket(person);
+      destination[shard].emplace_back(person, row->event);
+    }
+  }
+}
+
 struct Catalog {
   Dict<int> product, campaign, category;
+  // A dense suffix index handles ordinary catalog IDs. The string comparison
+  // preserves padding and case; all other spellings use the exact dictionary.
+  std::vector<int> numbered_campaigns;
+  static int suffix(Str s) {
+    if (s.size() < 3 || s.size() > 8 || s[0] != 'c' || s[1] != '_')
+      return -1;
+    int value = 0;
+    for (unsigned char c : s.substr(2)) {
+      unsigned digit = unsigned(c) - '0';
+      if (digit > 9) return -1;
+      value = value * 10 + int(digit);
+    }
+    return value;
+  }
+  int campaign_id(Str s) const {
+    unsigned n = unsigned(suffix(s));
+    if (n < numbered_campaigns.size()) {
+      int id = numbered_campaigns[n];
+      if (id && campaigns[id] == s) return id;
+    }
+    auto it = campaign.find(s);
+    return it == campaign.end() ? 0 : it->second;
+  }
   std::vector<Str> categories{"unknown"}, campaigns{"organic"},
       channels{"organic"};
   template <class F> void read(Input &input, const fs::path &file, F f) {
@@ -102,6 +205,11 @@ struct Catalog {
       campaigns.push_back(r[0]);
       channels.push_back(r[1]);
     });
+    numbered_campaigns.resize(std::min<size_t>(campaigns.size() * 2, 1000000));
+    for (size_t i = 1; i < campaigns.size(); ++i) {
+      unsigned n = unsigned(suffix(campaigns[i]));
+      if (n < numbered_campaigns.size()) numbered_campaigns[n] = int(i);
+    }
   }
 };
 struct Window {
@@ -152,6 +260,78 @@ template <class T> struct ScratchArray {
 struct ActiveCampaign {
   size_t count{}, slot{};
 };
+
+struct TimeBins {
+  struct Bin {
+    uint32_t first, last;
+    size_t count{};
+  };
+  std::vector<Bin> bins;
+  std::vector<uint64_t> occupied;
+
+  void configure(uint64_t duration) {
+    uint64_t count = (duration - 1) / session_gap + 1;
+    if (count <= 4096) {
+      bins.resize(count);
+      occupied.resize((count + 63) / 64);
+    }
+  }
+
+  template <class Visit>
+  void sessions(std::span<CompactEvent> events, Time window_start, Visit visit) {
+    size_t purchases = 0;
+    {
+      MEASURE(session);
+      for (const auto event : events) {
+        uint32_t offset = event.offset(), index = offset / session_gap;
+        Bin &bin = bins[index];
+        if (bin.count++ == 0) {
+          bin.first = bin.last = offset;
+          occupied[index / 64] |= uint64_t(1) << (index % 64);
+        } else {
+          bin.first = std::min(bin.first, offset);
+          bin.last = std::max(bin.last, offset);
+        }
+        // Earlier rows have been consumed; reuse that space for purchases.
+        if (event.bits & 0xffffff)
+          events[purchases++] = event;
+      }
+    }
+    auto bought = events.first(purchases);
+    {
+      MEASURE(sorting);
+      std::sort(bought.begin(), bought.end());
+    }
+    uint32_t first = 0, last = 0;
+    size_t count = 0, next_purchase = 0;
+    auto emit = [&] {
+      size_t begin = next_purchase;
+      while (next_purchase < bought.size() && bought[next_purchase].offset() <= last)
+        ++next_purchase;
+      visit(window_start + first, count, bought.subspan(begin, next_purchase - begin));
+    };
+    // Every event inside one bin is within the gap. Between occupied bins,
+    // only the last actual timestamp and the next first timestamp matter.
+    for (size_t word = 0; word < occupied.size(); ++word) {
+      for (uint64_t mask = occupied[word]; mask; mask &= mask - 1) {
+        Bin &bin = bins[word * 64 + std::countr_zero(mask)];
+        if (count && bin.first - last > session_gap) {
+          emit();
+          count = 0;
+        }
+        if (!count)
+          first = bin.first;
+        last = bin.last;
+        count += bin.count;
+        bin.count = 0;
+      }
+      occupied[word] = 0;
+    }
+    if (count)
+      emit();
+  }
+};
+
 struct Result {
   ScratchArray<ActiveCampaign> activity;
   ScratchArray<int64_t> spend;
@@ -159,10 +339,12 @@ struct Result {
   std::vector<UserDay> users;
   Totals sparse;
   std::vector<Counts> table;
+  TimeBins time_bins;
   int32_t first_day{};
   size_t campaigns{};
   void configure(Window w, const Catalog &cat, unsigned threads) {
     size_t count = cat.campaigns.size();
+    time_bins.configure(uint64_t(w.end) - uint64_t(w.start));
     activity.configure(count);
     spend.configure(cat.categories.size());
     first_day = utc_day(w.start);
@@ -207,17 +389,17 @@ std::vector<CampaignDay> campaign_days(const std::vector<Result> &results,
   return rows;
 }
 
-void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
-               const Catalog &cat, Result &result) {
+template <class StoredEvent>
+void summarize(Key user, std::span<StoredEvent> events, std::span<ClickFor<StoredEvent>> clicks,
+               Time window_start, const Catalog &cat, Result &result) {
   if (events.empty())
     return;
+  const bool use_bins = std::is_same_v<StoredEvent, CompactEvent> &&
+                        events.size() >= 128 && !result.time_bins.bins.empty();
   {
     MEASURE(sorting);
-    std::sort(events.begin(), events.end(),
-              [](auto a, auto b) { return a.ts < b.ts; });
-    std::sort(clicks.begin(), clicks.end(), [](const auto &a, const auto &b) {
-      return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
-    });
+    if (!use_bins) std::sort(events.begin(), events.end());
+    std::sort(clicks.begin(), clicks.end());
   }
   // Exact click copies have no effect on the winner or distinct active
   // campaigns.
@@ -237,20 +419,18 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     result.users.push_back(daily);
     result.purchased.clear();
   };
-  for (size_t i = 0; i < events.size();) {
-    auto start = events[i].ts;
+  auto visit = [&](Time start, size_t count, std::span<StoredEvent> purchases) {
     auto day = utc_day(start);
     if (daily.sessions && day != daily.day) {
       finish_day();
       daily = {user, day, 0, 0, 0, {}};
     }
     daily.day = day;
-    size_t first = i;
     int64_t revenue = 0;
     {
       MEASURE(session);
-      do {
-        auto e = events[i++];
+      for (auto record : purchases) {
+        auto e = record.decode(window_start);
         if (e.price) {
           auto &spent = result.spend[e.category];
           if (!spent)
@@ -258,14 +438,14 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
           spent += e.price;
           revenue += e.price;
         }
-      } while (i < events.size() && events[i].ts - events[i - 1].ts <= 1800000);
+      }
     }
     ++daily.sessions;
-    daily.events += i - first;
+    daily.events += count;
     daily.revenue += revenue;
     {
       MEASURE(attribution);
-      while (right < clicks.size() && clicks[right].ts <= start) {
+      while (right < clicks.size() && clicks[right].time(window_start) <= start) {
         int campaign = clicks[right++].campaign;
         auto &state = result.activity[campaign];
         if (state.count++ == 0) {
@@ -273,7 +453,7 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
           result.active.push_back(campaign);
         }
       }
-      while (left < right && clicks[left].ts < start - reach) {
+      while (left < right && clicks[left].time(window_start) < start - reach) {
         auto &state = result.activity[clicks[left++].campaign];
         if (--state.count == 0) {
           int moved = result.active.back();
@@ -291,6 +471,18 @@ void summarize(Key user, std::span<Event> events, std::span<Click> clicks,
     counts.revenue += revenue;
     for (int campaign : result.active)
       ++result.at(campaign, day).assists;
+  };
+  if (use_bins) {
+    if constexpr (std::is_same_v<StoredEvent, CompactEvent>)
+      result.time_bins.sessions(events, window_start, visit);
+  } else {
+    for (size_t i = 0; i < events.size();) {
+      const size_t first = i++;
+      while (i < events.size() &&
+             events[i].decode(window_start).ts - events[i-1].decode(window_start).ts <= session_gap)
+        ++i;
+      visit(events[first].decode(window_start).ts, i-first, events.subspan(first, i-first));
+    }
   }
   finish_day();
   for (int campaign : result.active)
@@ -308,15 +500,14 @@ struct Timer {
     last = now;
   }
 };
-void run(const fs::path &data, const fs::path &output, unsigned threads) {
-  Timer timer;
-  Input input;
-  Window window(input.map(data / "manifest.json"));
-  Catalog cat(input, data);
+template <class StoredEvent>
+void process(const fs::path &data, const fs::path &output, unsigned threads,
+             Input &input, Window window, const Catalog &cat, Timer &timer) {
+  using Revision = Candidate<StoredEvent>;
   Identities ids;
   auto links = input.parts(data / "links");
   timer.mark("catalogs and link mapping");
-  std::vector<Worker> workers(threads);
+  std::vector<Worker<StoredEvent>> workers(threads);
   auto events = input.parts(data / "events");
   size_t event_bytes = 0;
   for (auto chunk : events)
@@ -324,7 +515,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
   // A bounded capacity hint only. All vectors grow independently on skew
   // or unusual row widths. Allow up to 2 GiB total initial storage.
   auto hint =
-      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Candidate)) /
+      std::min(event_bytes / 88, (size_t(2) << 30) / sizeof(Revision)) /
       threads / shards;
   for (auto &worker : workers)
     for (auto &bin : worker.candidates)
@@ -354,7 +545,8 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
       Key id = workers[t].pool.encode(r[0], 'e');
       Event e = validate(r, ingest, cat, window);
       Key user = e.ts == bad ? Key{} : workers[t].pool.encode(r[1], 'u');
-      workers[t].candidates[bucket(id)].push_back({id, user, ingest, e});
+      workers[t].candidates[bucket(id)].push_back(
+          {id, user, ingest, StoredEvent::encode(e, window.start)});
     });
   });
   timer.mark("event CSV, validation and partition");
@@ -367,7 +559,7 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     size_t capacity = 1;
     while (capacity < count + count / 2)
       capacity *= 2;
-    std::vector<Candidate *> best(capacity, nullptr);
+    std::vector<Revision *> best(capacity, nullptr);
     for (auto &w : workers)
       for (auto &e : w.candidates[b]) {
         size_t slot = (e.id.hash() / shards) & (capacity - 1);
@@ -376,19 +568,15 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
         if (!best[slot])
           best[slot] = &e;
         else if (best[slot]->ingest > e.ingest) {
-          best[slot]->event.ts = bad;
+          best[slot]->event.discard();
           best[slot] = &e;
         } else
-          e.event.ts = bad;
+          e.event.discard();
       }
     for (auto &w : workers)
-      for (auto &e : w.candidates[b])
-        if (e.event.ts != bad) {
-          auto user = ids.resolve(e.user);
-          workers[t].events[bucket(user)].emplace_back(user, e.event);
-        }
+      route_winners<StoredEvent>(w.candidates[b], ids, workers[t].events);
     for (auto &w : workers)
-      std::vector<Candidate>().swap(w.candidates[b]);
+      std::vector<Revision>().swap(w.candidates[b]);
   });
   timer.mark("global event dedup and person partition");
   auto clicks = input.parts(data / "clicks");
@@ -397,13 +585,13 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
       if (r[0].empty() || r[1].empty())
         return;
       Time ts = timestamp(r[3]);
-      auto c = cat.campaign.find(r[2]);
+      int c = cat.campaign_id(r[2]);
       if (ts < window.start - reach || ts >= window.end ||
-          c == cat.campaign.end())
+          !c)
         return;
       Key user = ids.resolve(workers[t].pool.encode(r[1], 'u'));
       workers[t].clicks[bucket(user)].emplace_back(user,
-                                                   Click{r[0], ts, c->second});
+                                                   ClickFor<StoredEvent>::make(workers[t].pool, r[0], ts, c, window.start));
     });
   });
   timer.mark("click CSV and person partition");
@@ -412,8 +600,8 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
     result.configure(window, cat, threads);
   parallel(shards, threads, [&](size_t b, unsigned t) {
     std::vector<Group> groups;
-    std::vector<Event> ordered_events;
-    std::vector<Click> ordered_clicks;
+    std::vector<StoredEvent> ordered_events;
+    std::vector<ClickFor<StoredEvent>> ordered_clicks;
     {
       MEASURE(grouping);
       size_t event_count = 0;
@@ -442,15 +630,15 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
         for (auto &[u, c] : w.clicks[b])
           if (u.bits != UINTPTR_MAX)
             ordered_clicks[groups[u.bits].click_end++] = c;
-        decltype(w.events)::value_type().swap(w.events[b]);
-        decltype(w.clicks)::value_type().swap(w.clicks[b]);
+        typename decltype(w.events)::value_type().swap(w.events[b]);
+        typename decltype(w.clicks)::value_type().swap(w.clicks[b]);
       }
     }
     size_t ep = 0, cp = 0;
     for (auto &g : groups) {
       summarize(g.user, std::span(ordered_events).subspan(ep, g.event_end - ep),
-                std::span(ordered_clicks).subspan(cp, g.click_end - cp), cat,
-                results[t]);
+                std::span(ordered_clicks).subspan(cp, g.click_end - cp),
+                window.start, cat, results[t]);
       ep = g.event_end;
       cp = g.click_end;
     }
@@ -469,6 +657,19 @@ void run(const fs::path &data, const fs::path &output, unsigned threads) {
 #ifdef SHOPPING_DIAGNOSTICS
   metrics::report();
 #endif
+}
+void run(const fs::path &data, const fs::path &output, unsigned threads) {
+  Timer timer;
+  Input input;
+  Window window(input.map(data / "manifest.json"));
+  Catalog cat(input, data);
+  const uint64_t duration = uint64_t(window.end) - uint64_t(window.start);
+  // The maximum legal price occupies 24 bits. Index zero is the unknown
+  // category, and the final timestamp-offset value is reserved for discards.
+  if (duration <= UINT32_MAX - reach && cat.categories.size() <= 256)
+    process<CompactEvent>(data, output, threads, input, window, cat, timer);
+  else
+    process<Event>(data, output, threads, input, window, cat, timer);
 }
 int main(int argc, char **argv) {
   auto env = [](const char *key, const char *fallback) {

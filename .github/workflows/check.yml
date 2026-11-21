@@ -15,7 +15,7 @@ jobs:
     env:
       IMAGE: shopping:candidate
       MEM: 7g
-      BASE_COMMIT: a430cc5e045f514a08f8bbdf1deef2465d746b4d
+      BASE_COMMIT: c94a3b5ecb8b6fc1a8f1439c26eb0b80e3e2b172
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,6 +23,10 @@ jobs:
           persist-credentials: false
       - name: Build the linux/amd64 image and generator
         run: |
+          for flag in -msse2 -msse4.2 -march=x86-64-v3; do
+            c++ -std=c++20 -O2 "$flag" tests/input.cpp -o "$RUNNER_TEMP/check-parser"
+            "$RUNNER_TEMP/check-parser"
+          done
           docker build --platform linux/amd64 -t "$IMAGE" .
           python3 -m venv "$RUNNER_TEMP/checker"
           "$RUNNER_TEMP/checker/bin/pip" install polars==2.1.0
@@ -42,6 +46,7 @@ jobs:
       - name: Compare all fixtures and both public dev tables
         run: |
           python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+          python tests/compact_cases.py scripts/docker_run.sh
           "$RUNNER_TEMP/generate" --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/dev"
           scripts/docker_run.sh "$RUNNER_TEMP/dev" "$RUNNER_TEMP/dev-out"
           python scripts/compare.py "$RUNNER_TEMP/dev-out" "$RUNNER_TEMP/dev-answer"
